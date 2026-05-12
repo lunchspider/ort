@@ -1,55 +1,72 @@
 name: 🚩 Misc Checks
 on:
-  workflow_dispatch:
   push:
     paths:
       - '.github/workflows/other-checks.yml'
       - 'src/**/*.rs'
-      - 'examples/**/*'
       - 'ort-sys/**/*.rs'
       - 'ort-sys/**/dist.txt'
-      - 'build.rs'
       - 'Cargo.toml'
-      - '.cargo/**/*'
-      - 'tests/**/*'
   pull_request:
+    types: [ opened, synchronize, reopened ]
     paths:
       - '.github/workflows/other-checks.yml'
       - 'src/**/*.rs'
       - 'examples/**/*'
       - 'ort-sys/**/*.rs'
       - 'ort-sys/**/dist.txt'
-      - 'build.rs'
       - 'Cargo.toml'
-      - '.cargo/**/*'
-      - 'tests/**/*'
+permissions:
+  contents: read
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
 env:
   RUST_BACKTRACE: 1
-  CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_DEV_DEBUG: 0
 jobs:
   no-default-features:
     name: --no-default-features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2.9.1
       - name: Run checks
         run: |
           cargo check -p ort --no-default-features
+          cargo check -p ort --no-default-features --features api-26
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install stable Rust toolchain
-        uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2.7.8
+        uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2.9.1
       - name: Run checks
         run: |
           cargo check -p ort
           cargo check -p ort --features load-dynamic
+  multiversion:
+    name: Multiversion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Run checks
+        run: |
+          cargo check -p ort --no-default-features --features api-17,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-18,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-19,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-20,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-21,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-22,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-23,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-24,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-25,std,ndarray,tracing
+          cargo check -p ort --no-default-features --features api-26,std,ndarray,tracing

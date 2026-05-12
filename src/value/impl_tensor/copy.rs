@@ -4,14 +4,12 @@
 use alloc::{format, string::ToString};
 use core::ops::{Deref, DerefMut};
 
-use super::DefiniteTensorValueTypeMarker;
 use crate::{
-	Error, OnceLock, Result, execution_providers as ep,
-	io_binding::IoBinding,
+	Error, OnceLock, Result, ep,
 	memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
-	session::{NoSelectedOutputs, RunOptions, Session, builder::GraphOptimizationLevel},
+	session::{IoBinding, NoSelectedOutputs, RunOptions, Session, builder::GraphOptimizationLevel},
 	util::{MiniMap, Mutex, MutexGuard},
-	value::Value
+	value::{TensorValueTypeMarker, Value}
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,20 +34,20 @@ static IDENTITY_RUN_OPTIONS: OnceLock<RunOptions<NoSelectedOutputs>> = OnceLock:
 
 fn ep_for_device(device: AllocationDevice, device_id: i32) -> Result<ep::ExecutionProviderDispatch> {
 	Ok(match device {
-		AllocationDevice::CPU => ep::CPUExecutionProvider::default().with_arena_allocator(false).build(),
-		AllocationDevice::CUDA | AllocationDevice::CUDA_PINNED => ep::CUDAExecutionProvider::default()
+		AllocationDevice::CPU => ep::CPU::default().with_arena_allocator(false).build(),
+		AllocationDevice::CUDA | AllocationDevice::CUDA_PINNED => ep::CUDA::default()
 			.with_device_id(device_id)
 			.with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
 			.with_conv_max_workspace(false)
-			.with_conv_algorithm_search(ep::cuda::CuDNNConvAlgorithmSearch::Default)
+			.with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Default)
 			.build(),
-		AllocationDevice::DIRECTML => ep::DirectMLExecutionProvider::default().with_device_id(device_id).build(),
-		AllocationDevice::CANN | AllocationDevice::CANN_PINNED => ep::CANNExecutionProvider::default()
+		AllocationDevice::DIRECTML => ep::DirectML::default().with_device_id(device_id).build(),
+		AllocationDevice::CANN | AllocationDevice::CANN_PINNED => ep::CANN::default()
 			.with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
 			.with_cann_graph(false)
 			.with_device_id(device_id)
 			.build(),
-		AllocationDevice::OPENVINO_CPU | AllocationDevice::OPENVINO_GPU => ep::OpenVINOExecutionProvider::default()
+		AllocationDevice::OPENVINO_CPU | AllocationDevice::OPENVINO_GPU => ep::OpenVINO::default()
 			.with_num_threads(1)
 			.with_device_type(if device == AllocationDevice::OPENVINO_CPU {
 				"CPU".to_string()
@@ -57,7 +55,7 @@ fn ep_for_device(device: AllocationDevice, device_id: i32) -> Result<ep::Executi
 				format!("GPU.{device_id}")
 			})
 			.build(),
-		AllocationDevice::HIP | AllocationDevice::HIP_PINNED => ep::ROCmExecutionProvider::default()
+		AllocationDevice::HIP | AllocationDevice::HIP_PINNED => ep::ROCm::default()
 			.with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
 			.with_hip_graph(false)
 			.with_exhaustive_conv_search(false)
@@ -67,7 +65,7 @@ fn ep_for_device(device: AllocationDevice, device_id: i32) -> Result<ep::Executi
 	})
 }
 
-impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Value<Type> {
+impl<Type: TensorValueTypeMarker + ?Sized> Value<Type> {
 	/// Copies the contents of this tensor to another device, returning the newly created tensor value.
 	///
 	/// ```
@@ -89,6 +87,7 @@ impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Value<Type> {
 	/// # Ok(())
 	/// # }
 	/// ```
+	#[cfg_attr(docsrs, doc(cfg(not(target_arch = "wasm32"))))]
 	pub fn to(&self, device: AllocationDevice, device_id: i32) -> Result<Value<Type>> {
 		self.copy_to_inner(device, device_id, |identity_session| {
 			let target_memory_info = MemoryInfo::new(device, device_id, AllocatorType::Device, MemoryType::Default)?;
@@ -119,6 +118,7 @@ impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Value<Type> {
 	/// # Ok(())
 	/// # }
 	/// ```
+	#[cfg_attr(docsrs, doc(cfg(not(target_arch = "wasm32"))))]
 	pub fn to_async(&self, device: AllocationDevice, device_id: i32) -> Result<Value<Type>> {
 		self.copy_to_inner(device, device_id, |identity_session| {
 			let target_memory_info = MemoryInfo::new(device, device_id, AllocatorType::Device, MemoryType::Default)?;
@@ -158,6 +158,7 @@ impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Value<Type> {
 	/// # Ok(())
 	/// # }
 	/// ```
+	#[cfg_attr(docsrs, doc(cfg(not(target_arch = "wasm32"))))]
 	pub fn copy_into(&self, target: &mut Value<Type>) -> Result<()> {
 		if self.dtype() != target.dtype() {
 			return Err(Error::new("target data type does not match source data type"));
@@ -196,6 +197,7 @@ impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Value<Type> {
 	/// # Ok(())
 	/// # }
 	/// ```
+	#[cfg_attr(docsrs, doc(cfg(not(target_arch = "wasm32"))))]
 	pub fn copy_into_async(&self, target: &mut Value<Type>) -> Result<()> {
 		if self.dtype() != target.dtype() {
 			return Err(Error::new("target data type does not match source data type"));
@@ -225,11 +227,14 @@ impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Value<Type> {
 
 		let mut identity_session = IdentitySessionHandle::new(source_memory_info, device, device_id, tensor_type)?;
 		identity_session.binding.bind_input("input", self)?;
-		runner(&mut identity_session)
+		let res = runner(&mut identity_session);
+		identity_session.binding.clear();
+		res
 	}
 }
 
-impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Clone for Value<Type> {
+#[cfg_attr(docsrs, doc(cfg(not(target_arch = "wasm32"))))]
+impl<Type: TensorValueTypeMarker + ?Sized> Clone for Value<Type> {
 	/// Creates a copy of this tensor and its data on the same device it resides on.
 	///
 	/// ```
@@ -249,6 +254,7 @@ impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Clone for Value<Type> {
 	/// # 	Ok(())
 	/// # }
 	/// ```
+	#[cfg_attr(docsrs, doc(cfg(not(target_arch = "wasm32"))))]
 	fn clone(&self) -> Self {
 		let memory_info = self.memory_info();
 		self.to(memory_info.allocation_device(), memory_info.device_id())
@@ -292,7 +298,7 @@ impl IdentitySessionHandle {
 				);
 
 				let mut builder = Session::builder()?
-					.with_optimization_level(GraphOptimizationLevel::Disable)?
+					.with_optimization_level(GraphOptimizationLevel::Level3)?
 					// since these sessions are persistent for the lifetime of the program, keep them as lean as possible
 					// by disabling threading & memory optimizations (there's only 1 operation in the graph anyway)
 					.with_intra_threads(1)?
@@ -300,7 +306,6 @@ impl IdentitySessionHandle {
 					.with_inter_op_spinning(false)?
 					.with_intra_op_spinning(false)?
 					.with_memory_pattern(false)?
-					.with_allocator(MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?)?
 					.with_no_environment_execution_providers()?;
 				// Avoid registering the same EP twice, since that's an error.
 				if source_ep.inner.name() != target_ep.inner.name() {
@@ -338,10 +343,12 @@ impl DerefMut for IdentitySessionHandle {
 
 #[cfg(test)]
 mod tests {
-	use crate::value::Tensor;
+	use crate::{
+		memory::{AllocationDevice, Allocator},
+		value::Tensor
+	};
 
 	#[test]
-	#[cfg(feature = "cuda")]
 	fn test_clone_tensor() -> crate::Result<()> {
 		let tensor = Tensor::<f32>::from_array(([1, 5], vec![2.167892, 333., 1.0, -0.0, f32::EPSILON]))?;
 		let clone = tensor.clone();
@@ -350,10 +357,32 @@ mod tests {
 	}
 
 	#[test]
+	fn test_tensor_to_cpu() -> crate::Result<()> {
+		let tensor = Tensor::<f32>::from_array(([1, 5], vec![2.167892, 333., 1.0, -0.0, f32::EPSILON]))?;
+
+		let tensor2 = tensor.to_async(AllocationDevice::CPU, 0)?;
+		let tensor3 = tensor2.to(AllocationDevice::CPU, 0)?;
+		assert_eq!(tensor.extract_tensor(), tensor3.extract_tensor());
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_bad_copy_into() -> crate::Result<()> {
+		let tensor = Tensor::<f32>::from_array(([1, 5], vec![2.167892, 333., 1.0, -0.0, f32::EPSILON]))?;
+
+		let mut target_bad_shape = Tensor::<f32>::new(&Allocator::default(), [3i64])?;
+		assert!(tensor.copy_into(&mut target_bad_shape).is_err());
+
+		let mut target_f64 = Tensor::<f64>::new(&Allocator::default(), [1i64, 5])?.into_dyn();
+		assert!(tensor.into_dyn().copy_into(&mut target_f64).is_err());
+
+		Ok(())
+	}
+
+	#[test]
 	#[cfg(feature = "cuda")]
 	fn test_copy_cuda() -> crate::Result<()> {
-		use crate::memory::AllocationDevice;
-
 		let tensor = Tensor::<f32>::from_array(([1, 5], vec![2.167892, 333., 1.0, -0.0, f32::EPSILON]))?;
 
 		let cuda_tensor = tensor.to(AllocationDevice::CUDA, 0)?;
@@ -372,8 +401,6 @@ mod tests {
 	#[test]
 	#[cfg(feature = "cuda")]
 	fn test_copy_cuda_async() -> crate::Result<()> {
-		use crate::memory::AllocationDevice;
-
 		let tensor = Tensor::<f32>::from_array(([1, 5], vec![2.167892, 333., 1.0, -0.0, f32::EPSILON]))?;
 
 		let cuda_tensor = tensor.to_async(AllocationDevice::CUDA, 0)?;
@@ -387,13 +414,13 @@ mod tests {
 	#[cfg(feature = "cuda")]
 	fn test_copy_into_cuda() -> crate::Result<()> {
 		use crate::{
-			execution_providers::CUDAExecutionProvider,
-			memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
+			ep,
+			memory::{AllocatorType, MemoryInfo, MemoryType},
 			session::Session
 		};
 
 		let dummy_session = Session::builder()?
-			.with_execution_providers([CUDAExecutionProvider::default().build()])?
+			.with_execution_providers([ep::CUDA::default().build()])?
 			.commit_from_file("tests/data/upsample.ort")?;
 
 		let allocator = Allocator::new(&dummy_session, MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?)?;
@@ -411,13 +438,13 @@ mod tests {
 	#[cfg(feature = "cuda")]
 	fn test_copy_into_async_cuda() -> crate::Result<()> {
 		use crate::{
-			execution_providers::CUDAExecutionProvider,
-			memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
+			ep,
+			memory::{AllocatorType, MemoryInfo, MemoryType},
 			session::Session
 		};
 
 		let dummy_session = Session::builder()?
-			.with_execution_providers([CUDAExecutionProvider::default().build()])?
+			.with_execution_providers([ep::CUDA::default().build()])?
 			.commit_from_file("tests/data/upsample.ort")?;
 
 		let allocator = Allocator::new(&dummy_session, MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?)?;

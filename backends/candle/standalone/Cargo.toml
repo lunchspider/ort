@@ -1,13 +1,13 @@
 [package]
 name = "ort-candle-standalone"
 publish = false
-version = "1.22.1"
-edition = "2021"
+version = "1.26.0"
+edition = "2024"
 
 [package.metadata.winresource]
 ProductName = "ONNX Runtime (candle)"
 FileDescription = "API-compatible ONNX Runtime implementation using candle"
-LegalCopyright = "Copyright ©️ 2025 pyke.io"
+LegalCopyright = "Copyright ©️ 2026 pyke.io"
 OriginalFilename = "onnxruntime+candle.dll"
 
 [lib]

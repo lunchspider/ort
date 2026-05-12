@@ -10,7 +10,8 @@ use crate::{
 	AsPointer, ErrorCode,
 	error::{Error, Result},
 	memory::Allocator,
-	ortsys
+	ortsys,
+	value::DynValue
 };
 
 pub trait SequenceValueTypeMarker: ValueTypeMarker {
@@ -73,22 +74,17 @@ pub type SequenceRef<'v, T> = ValueRef<'v, SequenceValueType<T>>;
 pub type SequenceRefMut<'v, T> = ValueRefMut<'v, SequenceValueType<T>>;
 
 impl<Type: SequenceValueTypeMarker + Sized> Value<Type> {
-	pub fn try_extract_sequence<OtherType: ValueTypeMarker + DowncastableTarget + Debug + Sized>(
-		&self,
-		allocator: &Allocator
-	) -> Result<Vec<ValueRef<'_, OtherType>>> {
+	pub fn try_extract_sequence<OtherType: ValueTypeMarker + DowncastableTarget + Debug + Sized>(&self) -> Result<Vec<Value<OtherType>>> {
 		match self.dtype() {
 			ValueType::Sequence(_) => {
+				let allocator = Allocator::default();
+
 				let mut len = 0;
 				ortsys![unsafe GetValueCount(self.ptr(), &mut len)?];
 
 				let mut vec = Vec::with_capacity(len);
 				for i in 0..len {
-					let mut value_ptr = ptr::null_mut();
-					ortsys![unsafe GetValue(self.ptr(), i as _, allocator.ptr().cast_mut(), &mut value_ptr)?; nonNull(value_ptr)];
-
-					let mut value = ValueRef::new(unsafe { Value::from_ptr(value_ptr, None) });
-					value.upgradable = false;
+					let value = extract_from_sequence(self.ptr(), i, &allocator)?;
 
 					let value_type = value.dtype();
 					if !OtherType::can_downcast(value.dtype()) {
@@ -98,7 +94,7 @@ impl<Type: SequenceValueTypeMarker + Sized> Value<Type> {
 						));
 					}
 
-					vec.push(value);
+					vec.push(value.downcast()?);
 				}
 				Ok(vec)
 			}
@@ -113,14 +109,14 @@ impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized + 'static> Value<Se
 	/// This `Value<T>` must be either a [`Tensor`] or [`Map`].
 	///
 	/// ```
-	/// # use ort::{memory::Allocator, value::{Sequence, Tensor}};
+	/// # use ort::{memory:: Allocator, value::{Sequence, Tensor}};
 	/// # fn main() -> ort::Result<()> {
-	/// # 	let allocator = Allocator::default();
+	/// # let allocator = Allocator::default();
 	/// let tensor1 = Tensor::<f32>::new(&allocator, [1_usize, 128, 128, 3])?;
 	/// let tensor2 = Tensor::<f32>::new(&allocator, [1_usize, 224, 224, 3])?;
 	/// let value = Sequence::new([tensor1, tensor2])?;
 	///
-	/// for tensor in value.extract_sequence(&allocator) {
+	/// for tensor in value.extract_sequence() {
 	/// 	println!("{:?}", tensor.shape());
 	/// }
 	/// # 	Ok(())
@@ -138,23 +134,41 @@ impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized + 'static> Value<Se
 			nonNull(value_ptr)
 		];
 		Ok(Value {
-			inner: Arc::new(ValueInner {
-				ptr: value_ptr,
+			inner: ValueInner::new_backed(
+				value_ptr,
 				// 1. `CreateValue` enforces that we have at least 1 value
 				// 2. `CreateValue` internally uses the first value to determine the element type, so we do the same here
-				dtype: ValueType::Sequence(Box::new(values[0].inner.dtype.clone())),
-				drop: true,
-				memory_info: None,
-				_backing: Some(Box::new(values))
-			}),
+				ValueType::Sequence(Box::new(values[0].inner.dtype.clone())),
+				None,
+				true,
+				Box::new(values)
+			),
 			_markers: PhantomData
 		})
 	}
 }
 
 impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> Value<SequenceValueType<T>> {
-	pub fn extract_sequence(&self, allocator: &Allocator) -> Vec<ValueRef<'_, T>> {
-		self.try_extract_sequence(allocator).expect("Failed to extract sequence")
+	pub fn extract_sequence(&self) -> Vec<Value<T>> {
+		self.try_extract_sequence().expect("Failed to extract sequence")
+	}
+
+	#[inline]
+	#[allow(clippy::len_without_is_empty)] // Sequences cannot be empty.
+	pub fn len(&self) -> usize {
+		let mut len = 0;
+		ortsys![unsafe GetValueCount(self.ptr(), &mut len).expect("infallible")];
+		len
+	}
+
+	pub fn get(&self, index: usize) -> Option<Value<T>> {
+		extract_from_sequence(self.ptr(), index, &Allocator::default())
+			.ok()
+			.and_then(|x| x.downcast().ok())
+	}
+
+	pub fn iter(&self) -> impl ExactSizeIterator<Item = Value<T>> {
+		(0..self.len()).map(|i| self.get(i).expect("infallible"))
 	}
 
 	/// Converts from a strongly-typed [`Sequence<T>`] to a type-erased [`DynSequence`].
@@ -165,7 +179,7 @@ impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> Value<SequenceValu
 
 	/// Converts from a strongly-typed [`Sequence<T>`] to a reference to a type-erased [`DynSequence`].
 	#[inline]
-	pub fn upcast_ref(&self) -> DynSequenceRef {
+	pub fn upcast_ref(&self) -> DynSequenceRef<'_> {
 		DynSequenceRef::new(Value {
 			inner: Arc::clone(&self.inner),
 			_markers: PhantomData
@@ -174,10 +188,72 @@ impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> Value<SequenceValu
 
 	/// Converts from a strongly-typed [`Sequence<T>`] to a mutable reference to a type-erased [`DynSequence`].
 	#[inline]
-	pub fn upcast_mut(&mut self) -> DynSequenceRefMut {
+	pub fn upcast_mut(&mut self) -> DynSequenceRefMut<'_> {
 		DynSequenceRefMut::new(Value {
 			inner: Arc::clone(&self.inner),
 			_markers: PhantomData
 		})
+	}
+}
+
+fn extract_from_sequence(ptr: *const ort_sys::OrtValue, i: usize, allocator: &Allocator) -> Result<DynValue> {
+	let mut value_ptr = ptr::null_mut();
+	ortsys![unsafe GetValue(ptr, i as _, allocator.ptr().cast_mut(), &mut value_ptr)?; nonNull(value_ptr)];
+	Ok(unsafe { Value::from_ptr(value_ptr, None) })
+}
+
+pub struct IntoIter<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> {
+	value: Value<SequenceValueType<T>>,
+	i: usize
+}
+
+impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> Iterator for IntoIter<T> {
+	type Item = Value<T>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let val = self.value.get(self.i);
+		self.i += 1;
+		val
+	}
+}
+
+impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> ExactSizeIterator for IntoIter<T> {
+	fn len(&self) -> usize {
+		self.value.len()
+	}
+}
+
+impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> IntoIterator for Value<SequenceValueType<T>> {
+	type Item = Value<T>;
+	type IntoIter = IntoIter<T>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		IntoIter { value: self, i: 0 }
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::value::{Sequence, Shape, Tensor};
+
+	#[test]
+	fn test_sequence_basic() -> crate::Result<()> {
+		let tensor1 = Tensor::from_array((Shape::new([5]), vec![1i32, 2, 3, 4, 5]))?;
+		let tensor2 = Tensor::from_array((Shape::new([5]), vec![5i32, 4, 3, 2, 1]))?;
+		let tensor3 = Tensor::from_array((Shape::new([5]), vec![10i32, 2, 30, 4, 50]))?;
+		let tensors = [tensor1, tensor2, tensor3];
+
+		let seq = Sequence::new(tensors.clone())?;
+		assert_eq!(seq.len(), 3);
+		assert_eq!(seq.iter().len(), 3);
+
+		for (i, tensor) in seq.iter().enumerate() {
+			assert_eq!(tensors[i].extract_tensor(), tensor.extract_tensor());
+		}
+		for (i, tensor) in seq.into_iter().enumerate() {
+			assert_eq!(tensors[i].extract_tensor(), tensor.extract_tensor());
+		}
+
+		Ok(())
 	}
 }

@@ -1,4 +1,4 @@
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, sync::Arc};
 use core::{
 	fmt,
 	ptr::{self, NonNull}
@@ -9,14 +9,14 @@ use ort_sys::c_char;
 
 use super::{Checkpoint, Optimizer, training_api};
 use crate::{
-	AsPointer, char_p_to_string,
-	error::{Result, status_to_result},
+	AsPointer,
+	environment::Environment,
+	error::{Error, Result},
 	memory::Allocator,
 	ortsys,
 	session::{RunOptions, SessionInputValue, SessionInputs, SessionOutputs, builder::SessionBuilder},
-	tensor::IntoTensorElementType,
-	util::with_cstr_ptr_array,
-	value::{Tensor, Value}
+	util::{char_p_to_string, with_cstr_ptr_array},
+	value::{IntoTensorElementType, Tensor, Value}
 };
 
 #[derive(Debug)]
@@ -27,7 +27,8 @@ pub struct Trainer {
 	train_input_names: Vec<String>,
 	eval_input_names: Vec<String>,
 	ckpt: Checkpoint,
-	_allocator: Allocator
+	_allocator: Allocator,
+	_environment: Arc<Environment>
 }
 
 impl Trainer {
@@ -43,12 +44,10 @@ impl Trainer {
 		let eval_model_path = crate::util::path_to_os_char(eval_model_path);
 		let optimizer_model_path = crate::util::path_to_os_char(optimizer_model_path);
 
-		let env = crate::environment::get_environment()?;
-
 		let mut ptr: *mut ort_sys::OrtTrainingSession = ptr::null_mut();
 		ortsys![@training:
 			unsafe CreateTrainingSession(
-				env.ptr(),
+				session_options.environment.ptr(),
 				session_options.ptr(),
 				ckpt.ptr.as_ptr(),
 				training_model_path.as_ptr(),
@@ -58,7 +57,7 @@ impl Trainer {
 			)?;
 			nonNull(ptr)
 		];
-		Self::new_inner(ptr, allocator, ckpt)
+		Self::new_inner(ptr, &session_options.environment, allocator, ckpt)
 	}
 
 	pub fn new_from_artifacts(
@@ -91,12 +90,10 @@ impl Trainer {
 		eval_model: &[u8],
 		optimizer_model: &[u8]
 	) -> Result<Self> {
-		let env = crate::environment::get_environment()?;
-
 		let mut ptr: *mut ort_sys::OrtTrainingSession = ptr::null_mut();
 		ortsys![@training:
 			unsafe CreateTrainingSessionFromBuffer(
-				env.ptr(),
+				session_options.environment.ptr(),
 				session_options.ptr(),
 				ckpt.ptr.as_ptr(),
 				training_model.as_ptr().cast(),
@@ -109,10 +106,10 @@ impl Trainer {
 			)?;
 			nonNull(ptr)
 		];
-		Self::new_inner(ptr, allocator, ckpt)
+		Self::new_inner(ptr, &session_options.environment, allocator, ckpt)
 	}
 
-	fn new_inner(ptr: NonNull<ort_sys::OrtTrainingSession>, allocator: Allocator, ckpt: Checkpoint) -> Result<Self> {
+	fn new_inner(ptr: NonNull<ort_sys::OrtTrainingSession>, environment: &Arc<Environment>, allocator: Allocator, ckpt: Checkpoint) -> Result<Self> {
 		let api = training_api()?;
 		let train_output_names =
 			extract_io_names(ptr, &allocator, api.TrainingSessionGetTrainingModelOutputCount, api.TrainingSessionGetTrainingModelOutputName)?;
@@ -121,14 +118,17 @@ impl Trainer {
 		let train_input_names = extract_io_names(ptr, &allocator, api.TrainingSessionGetTrainingModelInputCount, api.TrainingSessionGetTrainingModelInputName)?;
 		let eval_input_names = extract_io_names(ptr, &allocator, api.TrainingSessionGetEvalModelInputCount, api.TrainingSessionGetEvalModelInputName)?;
 
+		crate::logging::create!(Trainer, ptr);
+
 		Ok(Self {
 			ptr,
-			_allocator: allocator,
 			train_output_names,
 			train_input_names,
 			eval_output_names,
 			eval_input_names,
-			ckpt
+			ckpt,
+			_allocator: allocator,
+			_environment: Arc::clone(environment)
 		})
 	}
 
@@ -298,7 +298,7 @@ impl AsPointer for Trainer {
 
 impl Drop for Trainer {
 	fn drop(&mut self) {
-		crate::trace!("dropping trainer");
+		crate::logging::drop!(Trainer, self.ptr);
 		ortsys![@training: unsafe ReleaseTrainingSession(self.ptr.as_ptr())];
 	}
 }
@@ -329,11 +329,11 @@ fn extract_io_names(
 	) -> ort_sys::OrtStatusPtr
 ) -> Result<Vec<String>> {
 	let mut count = 0;
-	unsafe { status_to_result(get_count(ptr.as_ptr(), &mut count)) }?;
+	unsafe { Error::result_from_status(get_count(ptr.as_ptr(), &mut count)) }?;
 	(0..count)
 		.map(|i| {
 			let mut name_bytes: *const c_char = ptr::null();
-			unsafe { status_to_result(get_name(ptr.as_ptr(), i, allocator.ptr().cast_mut(), &mut name_bytes)) }?;
+			unsafe { Error::result_from_status(get_name(ptr.as_ptr(), i, allocator.ptr().cast_mut(), &mut name_bytes)) }?;
 			let name = match char_p_to_string(name_bytes) {
 				Ok(name) => name,
 				Err(e) => {

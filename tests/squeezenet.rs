@@ -1,6 +1,6 @@
 use std::{
 	fs,
-	io::{self, BufRead, BufReader},
+	io::{BufRead, BufReader},
 	path::Path
 };
 
@@ -9,7 +9,7 @@ use ndarray::s;
 use ort::{
 	Error, inputs,
 	session::{Session, builder::GraphOptimizationLevel},
-	tensor::ArrayExtensions,
+	util::ArrayExt,
 	value::TensorRef
 };
 
@@ -17,7 +17,7 @@ use ort::{
 fn squeezenet_mushroom() -> ort::Result<()> {
 	const IMAGE_TO_LOAD: &str = "mushroom.png";
 
-	ort::init().with_name("integration_test").commit()?;
+	ort::init().with_name("integration_test").commit();
 
 	let mut session = Session::builder()?
 		.with_optimization_level(GraphOptimizationLevel::Level1)?
@@ -29,11 +29,11 @@ fn squeezenet_mushroom() -> ort::Result<()> {
 
 	let input0_shape = {
 		let metadata = session.metadata()?;
-		assert_eq!(metadata.name()?, "main_graph");
-		assert_eq!(metadata.producer()?, "pytorch");
+		assert_eq!(metadata.name().as_deref(), Some("main_graph"));
+		assert_eq!(metadata.producer().as_deref(), Some("pytorch"));
 
-		let input0_shape = session.inputs[0].input_type.tensor_shape().expect("input0 to be a tensor type");
-		let output0_shape = session.outputs[0].output_type.tensor_shape().expect("output0 to be a tensor type");
+		let input0_shape = session.inputs()[0].dtype().tensor_shape().expect("input0 to be a tensor type");
+		let output0_shape = session.outputs()[0].dtype().tensor_shape().expect("output0 to be a tensor type");
 
 		assert_eq!(&**input0_shape, [1, 3, 224, 224]);
 		assert_eq!(&**output0_shape, [1, 1000]);
@@ -94,20 +94,14 @@ fn squeezenet_mushroom() -> ort::Result<()> {
 }
 
 fn get_imagenet_labels() -> ort::Result<Vec<String>> {
-	// Download the ImageNet class labels, matching SqueezeNet's classes.
-	let labels_path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("synset.txt");
-	if !labels_path.exists() {
-		let url = "https://s3.amazonaws.com/onnx-model-zoo/synset.txt";
-		println!("Downloading {:?} to {:?}...", url, labels_path);
-		let resp = ureq::get(url).call().map_err(Error::wrap)?;
-
-		let mut reader = resp.into_body().into_reader();
-		let f = fs::File::create(&labels_path).unwrap();
-		let mut writer = io::BufWriter::new(f);
-
-		io::copy(&mut reader, &mut writer).unwrap();
-	}
-
-	let file = BufReader::new(fs::File::open(labels_path).unwrap());
+	let file = BufReader::new(
+		fs::File::open(
+			Path::new(env!("CARGO_MANIFEST_DIR"))
+				.join("tests")
+				.join("data")
+				.join("imagenet-classes.txt")
+		)
+		.unwrap()
+	);
 	file.lines().map(|line| line.map_err(Error::wrap)).collect()
 }

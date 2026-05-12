@@ -13,8 +13,9 @@ use std::sync::Mutex;
 use smallvec::SmallVec;
 
 use crate::{
+	Error,
 	error::Result,
-	session::{SessionOutputs, SharedSessionInner, run_options::UntypedRunOptions},
+	session::{SessionOutputs, SharedSessionInner, UntypedRunOptions},
 	util::{STACK_SESSION_INPUTS, STACK_SESSION_OUTPUTS},
 	value::{Value, ValueInner}
 };
@@ -22,14 +23,16 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct InferenceFutInner<'r> {
 	value: UnsafeCell<Option<Result<SessionOutputs<'r>>>>,
-	waker: Mutex<Option<Waker>>
+	waker: Mutex<Option<Waker>>,
+	run_options: Arc<UntypedRunOptions>
 }
 
 impl<'r> InferenceFutInner<'r> {
-	pub(crate) fn new() -> Self {
+	pub(crate) fn new(run_options: Arc<UntypedRunOptions>) -> Self {
 		InferenceFutInner {
 			waker: Mutex::new(None),
-			value: UnsafeCell::new(None)
+			value: UnsafeCell::new(None),
+			run_options
 		}
 	}
 
@@ -57,7 +60,6 @@ unsafe impl Sync for InferenceFutInner<'_> {}
 
 pub struct InferenceFut<'r, 'v> {
 	inner: Arc<InferenceFutInner<'r>>,
-	run_options: &'r UntypedRunOptions,
 	did_receive: bool,
 	_inputs: PhantomData<&'v ()>
 }
@@ -65,10 +67,9 @@ pub struct InferenceFut<'r, 'v> {
 unsafe impl Send for InferenceFut<'_, '_> {}
 
 impl<'r> InferenceFut<'r, '_> {
-	pub(crate) fn new(inner: Arc<InferenceFutInner<'r>>, run_options: &'r UntypedRunOptions) -> Self {
+	pub(crate) fn new(inner: Arc<InferenceFutInner<'r>>) -> Self {
 		Self {
 			inner,
-			run_options,
 			did_receive: false,
 			_inputs: PhantomData
 		}
@@ -94,7 +95,7 @@ impl<'r> Future for InferenceFut<'r, '_> {
 impl Drop for InferenceFut<'_, '_> {
 	fn drop(&mut self) {
 		if !self.did_receive {
-			let _ = self.run_options.terminate();
+			let _ = self.inner.run_options.terminate();
 			self.inner.set_waker(None);
 		}
 	}
@@ -102,13 +103,13 @@ impl Drop for InferenceFut<'_, '_> {
 
 pub(crate) struct AsyncInferenceContext<'r, 's> {
 	pub(crate) inner: Arc<InferenceFutInner<'r>>,
-	pub(crate) input_ort_values: SmallVec<*const ort_sys::OrtValue, { STACK_SESSION_INPUTS }>,
-	pub(crate) _input_inner_holders: SmallVec<Arc<ValueInner>, { STACK_SESSION_INPUTS }>,
-	pub(crate) input_name_ptrs: SmallVec<*const c_char, { STACK_SESSION_INPUTS }>,
-	pub(crate) output_name_ptrs: SmallVec<*const c_char, { STACK_SESSION_OUTPUTS }>,
+	pub(crate) input_ort_values: SmallVec<[*const ort_sys::OrtValue; STACK_SESSION_INPUTS]>,
+	pub(crate) _input_inner_holders: SmallVec<[Arc<ValueInner>; STACK_SESSION_INPUTS]>,
+	pub(crate) input_name_ptrs: SmallVec<[*const c_char; STACK_SESSION_INPUTS]>,
+	pub(crate) output_name_ptrs: SmallVec<[*const c_char; STACK_SESSION_OUTPUTS]>,
 	pub(crate) session_inner: &'s Arc<SharedSessionInner>,
-	pub(crate) output_names: SmallVec<&'r str, { STACK_SESSION_OUTPUTS }>,
-	pub(crate) output_value_ptrs: SmallVec<*mut ort_sys::OrtValue, { STACK_SESSION_OUTPUTS }>
+	pub(crate) output_names: SmallVec<[&'r str; STACK_SESSION_OUTPUTS]>,
+	pub(crate) output_value_ptrs: SmallVec<[*mut ort_sys::OrtValue; STACK_SESSION_OUTPUTS]>
 }
 
 pub(crate) extern "system" fn async_callback(user_data: *mut c_void, _: *mut *mut ort_sys::OrtValue, _: usize, status: ort_sys::OrtStatusPtr) {
@@ -119,7 +120,9 @@ pub(crate) extern "system" fn async_callback(user_data: *mut c_void, _: *mut *mu
 		drop(unsafe { CString::from_raw(p.cast_mut().cast()) });
 	}
 
-	if let Err(e) = unsafe { crate::error::status_to_result(status) } {
+	crate::logging::drop!(AsyncInferenceContext, user_data);
+
+	if let Err(e) = unsafe { Error::result_from_status(status) } {
 		ctx.inner.emplace_value(Err(e));
 		ctx.inner.wake();
 		return;

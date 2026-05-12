@@ -74,7 +74,7 @@ pub struct Allocator {
 	/// [`Allocator::default`], should **not** be released, so this field marks whether or not we should call
 	/// `ReleaseAllocator` on drop.
 	is_default: bool,
-	_info: Option<MemoryInfo>,
+	info: MemoryInfo,
 	/// Hold a reference to the session if this allocator is tied to one.
 	_session_inner: Option<Arc<SharedSessionInner>>
 }
@@ -85,20 +85,23 @@ unsafe impl Send for Allocator {}
 
 impl Allocator {
 	pub(crate) unsafe fn from_raw(ptr: NonNull<ort_sys::OrtAllocator>) -> Allocator {
+		let mut memory_info_ptr = ptr::null();
+		ortsys![unsafe AllocatorGetInfo(ptr.as_ptr(), &mut memory_info_ptr).expect("Failed to get memory info"); nonNull(memory_info_ptr)];
+
 		Allocator {
 			ptr,
 			is_default: false,
+			info: MemoryInfo::from_raw(memory_info_ptr, false),
 			// currently, this function is only ever used in session creation, where we call `CreateAllocator` manually and store the allocator resulting from
 			// this function in the `SharedSessionInner` - we don't need to hold onto the session, because the session is holding onto us.
-			_session_inner: None,
-			_info: None
+			_session_inner: None
 		}
 	}
 
 	/// Allocates a block of memory, of size `size_of::<T>() * len` bytes, using this allocator.
 	/// The memory will be automatically freed when the returned `AllocatedBlock` goes out of scope.
 	///
-	/// May return `None` if the allocation fails.
+	/// Returns an error if the allocation fails.
 	///
 	/// # Example
 	/// ```
@@ -110,14 +113,11 @@ impl Allocator {
 	/// 	*ptr.add(3) = 42;
 	/// };
 	/// ```
-	pub fn alloc<T>(&self, len: usize) -> Option<AllocatedBlock<'_>> {
-		let ptr = unsafe {
-			self.ptr
-				.as_ref()
-				.Alloc
-				.unwrap_or_else(|| unreachable!("Allocator method `Alloc` is null"))(self.ptr.as_ptr(), (len * mem::size_of::<T>()) as _)
-		};
-		if !ptr.is_null() { Some(AllocatedBlock { ptr, allocator: self }) } else { None }
+	pub fn alloc<T>(&self, len: usize) -> Result<AllocatedBlock<'_>> {
+		let mut ptr = ptr::null_mut();
+		ortsys![unsafe AllocatorAlloc(self.ptr.as_ptr(), (len * mem::size_of::<T>()) as _, &mut ptr)?; nonNull(ptr)];
+		crate::logging::create!(AllocatedBlock, ptr);
+		Ok(AllocatedBlock { ptr, allocator: self })
 	}
 
 	/// Frees an object allocated by this allocator, given the object's C pointer.
@@ -140,28 +140,25 @@ impl Allocator {
 	/// };
 	/// ```
 	pub unsafe fn free<T>(&self, ptr: *mut T) {
-		unsafe { self.ptr.as_ref().Free.unwrap_or_else(|| unreachable!("Allocator method `Free` is null"))(self.ptr.as_ptr(), ptr.cast()) };
+		ortsys![unsafe AllocatorFree(self.ptr.as_ptr(), ptr.cast()).expect("Failed to free")];
 	}
 
 	/// Returns the [`MemoryInfo`] describing this allocator.
-	pub fn memory_info(&self) -> MemoryInfo {
-		let memory_info_ptr = unsafe { self.ptr.as_ref().Info.unwrap_or_else(|| unreachable!("Allocator method `Info` is null"))(self.ptr.as_ptr()) };
-		let Some(memory_info_ptr) = NonNull::new(memory_info_ptr.cast_mut()) else {
-			panic!("expected `memory_info_ptr` to not be null");
-		};
-		MemoryInfo::from_raw(memory_info_ptr, false)
+	pub fn memory_info(&self) -> &MemoryInfo {
+		&self.info
 	}
 
 	/// Creates a new [`Allocator`] for the given session, to allocate memory on the device described in the
 	/// [`MemoryInfo`].
 	pub fn new(session: &Session, memory_info: MemoryInfo) -> Result<Self> {
-		let mut allocator_ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
-		ortsys![unsafe CreateAllocator(session.ptr(), memory_info.ptr.as_ptr(), &mut allocator_ptr)?; nonNull(allocator_ptr)];
+		let mut ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
+		ortsys![unsafe CreateAllocator(session.ptr(), memory_info.ptr.as_ptr(), &mut ptr)?; nonNull(ptr)];
+		crate::logging::create!(Allocator, ptr);
 		Ok(Self {
-			ptr: allocator_ptr,
+			ptr,
 			is_default: false,
-			_session_inner: Some(session.inner()),
-			_info: Some(memory_info)
+			info: memory_info,
+			_session_inner: Some(session.inner())
 		})
 	}
 }
@@ -179,12 +176,16 @@ impl Default for Allocator {
 				.expect("Failed to get default allocator");
 			nonNull(allocator_ptr)
 		];
+
+		let mut memory_info_ptr = ptr::null();
+		ortsys![unsafe AllocatorGetInfo(allocator_ptr.as_ptr(), &mut memory_info_ptr).expect("Failed to get memory info"); nonNull(memory_info_ptr)];
+
 		Self {
 			ptr: allocator_ptr,
 			is_default: true,
+			info: MemoryInfo::from_raw(memory_info_ptr, false),
 			// The default allocator isn't tied to a session.
-			_session_inner: None,
-			_info: None
+			_session_inner: None
 		}
 	}
 }
@@ -201,33 +202,34 @@ impl Drop for Allocator {
 	fn drop(&mut self) {
 		if !self.is_default {
 			ortsys![unsafe ReleaseAllocator(self.ptr.as_ptr())];
+			crate::logging::drop!(Allocator, self.ptr);
 		}
 	}
 }
 
 /// A block of memory allocated by an [`Allocator`].
 pub struct AllocatedBlock<'a> {
-	ptr: *mut c_void,
+	ptr: NonNull<c_void>,
 	allocator: &'a Allocator
 }
 
-impl AllocatedBlock<'_> {
+impl<'a> AllocatedBlock<'a> {
 	/// Returns a pointer to the allocated memory.
 	///
 	/// Note that, depending on the exact allocator used, this may not a pointer to memory accessible by the CPU.
 	pub fn as_ptr(&self) -> *const c_void {
-		self.ptr
+		self.ptr.as_ptr()
 	}
 
 	/// Returns a mutable pointer to the allocated memory.
 	///
 	/// Note that, depending on the exact allocator used, this may not a pointer to memory accessible by the CPU.
 	pub fn as_mut_ptr(&mut self) -> *mut c_void {
-		self.ptr
+		self.ptr.as_ptr()
 	}
 
 	/// Returns the [`Allocator`] that allocated this block of memory.
-	pub fn allocator(&self) -> &Allocator {
+	pub fn allocator(&self) -> &'a Allocator {
 		self.allocator
 	}
 
@@ -239,13 +241,14 @@ impl AllocatedBlock<'_> {
 	pub fn into_raw(self) -> *mut c_void {
 		let ptr = self.ptr;
 		mem::forget(self);
-		ptr
+		ptr.as_ptr()
 	}
 }
 
 impl Drop for AllocatedBlock<'_> {
 	fn drop(&mut self) {
-		unsafe { self.allocator.free(self.ptr) };
+		unsafe { self.allocator.free(self.ptr.as_ptr()) };
+		crate::logging::drop!(AllocatedBlock, self.ptr);
 	}
 }
 
@@ -339,7 +342,7 @@ impl From<ort_sys::OrtMemType> for MemoryType {
 pub enum DeviceType {
 	CPU,
 	GPU,
-	FPGA
+	NPU
 }
 
 impl From<DeviceType> for ort_sys::OrtMemoryInfoDeviceType {
@@ -347,7 +350,7 @@ impl From<DeviceType> for ort_sys::OrtMemoryInfoDeviceType {
 		match value {
 			DeviceType::CPU => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU,
 			DeviceType::GPU => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_GPU,
-			DeviceType::FPGA => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA
+			DeviceType::NPU => ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA
 		}
 	}
 }
@@ -357,7 +360,7 @@ impl From<ort_sys::OrtMemoryInfoDeviceType> for DeviceType {
 		match value {
 			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU => DeviceType::CPU,
 			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_GPU => DeviceType::GPU,
-			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA => DeviceType::FPGA
+			ort_sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA => DeviceType::NPU
 		}
 	}
 }
@@ -395,15 +398,13 @@ impl MemoryInfo {
 	/// # }
 	/// ```
 	pub fn new(allocation_device: AllocationDevice, device_id: c_int, allocator_type: AllocatorType, memory_type: MemoryType) -> Result<Self> {
-		let mut memory_info_ptr: *mut ort_sys::OrtMemoryInfo = ptr::null_mut();
+		let mut ptr: *mut ort_sys::OrtMemoryInfo = ptr::null_mut();
 		ortsys![
-			unsafe CreateMemoryInfo(allocation_device.as_str().as_ptr().cast(), allocator_type.into(), device_id, memory_type.into(), &mut memory_info_ptr)?;
-			nonNull(memory_info_ptr)
+			unsafe CreateMemoryInfo(allocation_device.0.as_ptr().cast(), allocator_type.into(), device_id, memory_type.into(), &mut ptr)?;
+			nonNull(ptr)
 		];
-		Ok(Self {
-			ptr: memory_info_ptr,
-			should_release: true
-		})
+		crate::logging::create!(MemoryInfo, ptr);
+		Ok(Self { ptr, should_release: true })
 	}
 
 	pub(crate) unsafe fn from_value(value_ptr: NonNull<ort_sys::OrtValue>) -> Option<Self> {
@@ -425,7 +426,7 @@ impl MemoryInfo {
 
 	// All getter functions are (at least currently) infallible - they simply just dereference the corresponding fields,
 	// and always return `nullptr` for the status; so none of these have to return `Result`s.
-	// https://github.com/microsoft/onnxruntime/blob/v1.22.1/onnxruntime/core/framework/allocator.cc#L181
+	// https://github.com/microsoft/onnxruntime/blob/v1.26.0/onnxruntime/core/framework/allocator.cc#L338
 
 	/// Returns the [`MemoryType`] described by this struct.
 	/// ```
@@ -503,7 +504,14 @@ impl MemoryInfo {
 	/// Returns `true` if this memory is accessible by the CPU; meaning that, if a value were allocated on this device,
 	/// it could be extracted to an `ndarray` or slice.
 	pub fn is_cpu_accessible(&self) -> bool {
-		self.device_type() == DeviceType::CPU
+		// CUDA_PINNED used to be `DeviceType::CPU` pre-1.23, but now is `DeviceType::GPU`, so we have to use
+		// `MemoryInfoGetDeviceMemType` instead. But that returns `DEFAULT` (implying non-host accessible) for the CPU
+		// device, so we still need the old check too. I hate this library.
+		#[cfg(feature = "api-23")]
+		return self.device_type() == DeviceType::CPU
+			|| ortsys![unsafe MemoryInfoGetDeviceMemType(self.ptr.as_ptr())] == ort_sys::OrtDeviceMemoryType::OrtDeviceMemoryType_HOST_ACCESSIBLE;
+		#[cfg(not(feature = "api-23"))]
+		return self.device_type() == DeviceType::CPU;
 	}
 }
 
@@ -539,6 +547,7 @@ impl Drop for MemoryInfo {
 	fn drop(&mut self) {
 		if self.should_release {
 			ortsys![unsafe ReleaseMemoryInfo(self.ptr.as_ptr())];
+			crate::logging::drop!(MemoryInfo, self.ptr);
 		}
 	}
 }
@@ -554,6 +563,18 @@ mod tests {
 		assert_eq!(a, b);
 		let c = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
 		assert_ne!(a, c);
+		Ok(())
+	}
+
+	#[test]
+	#[cfg(feature = "cuda")]
+	fn test_cpu_accessible() -> crate::Result<()> {
+		let mem = MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, MemoryType::Default)?;
+		assert!(mem.is_cpu_accessible());
+		let mem = MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?;
+		assert!(!mem.is_cpu_accessible());
+		let mem = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?;
+		assert!(mem.is_cpu_accessible());
 		Ok(())
 	}
 }

@@ -2,13 +2,15 @@
 
 #![allow(unused)]
 
+use std::path::PathBuf;
+
 pub const PYKE_ROOT: &str = "ort.pyke.io";
 
 #[cfg(all(target_os = "windows", target_arch = "x86"))]
 macro_rules! win32_extern {
     ($library:literal $abi:literal $($link_name:literal)? $(#[$doc:meta])? fn $($function:tt)*) => (
         #[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim", import_name_type = "undecorated")]
-        extern $abi {
+        unsafe extern $abi {
             $(#[$doc])?
             $(#[link_name=$link_name])?
             fn $($function)*;
@@ -19,7 +21,7 @@ macro_rules! win32_extern {
 macro_rules! win32_extern {
 	($library:literal $abi:literal $($link_name:literal)? $(#[$doc:meta])? fn $($function:tt)*) => (
 		#[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim")]
-		extern "C" {
+		unsafe extern "C" {
 			$(#[$doc])?
 			$(#[link_name=$link_name])?
 			fn $($function)*;
@@ -95,7 +97,7 @@ mod windows {
 }
 #[cfg(target_os = "windows")]
 #[must_use]
-pub fn cache_dir() -> Option<std::path::PathBuf> {
+fn cache_dir_default() -> Option<PathBuf> {
 	self::windows::known_folder_local_app_data().map(|h| h.join(PYKE_ROOT))
 }
 
@@ -125,7 +127,7 @@ mod unix {
 		pub pw_shell: *mut c_char
 	}
 
-	extern "C" {
+	unsafe extern "C" {
 		fn sysconf(name: c_int) -> c_long;
 		fn getpwuid_r(uid: uid_t, pwd: *mut passwd, buf: *mut c_char, buflen: size_t, result: *mut *mut passwd) -> c_int;
 		fn getuid() -> uid_t;
@@ -153,17 +155,17 @@ mod unix {
 		}
 		#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "emscripten")))]
 		unsafe fn fallback() -> Option<OsString> {
-			let amt = match sysconf(SC_GETPW_R_SIZE_MAX) {
+			let amt = match unsafe { sysconf(SC_GETPW_R_SIZE_MAX) } {
 				n if n < 0 => 512,
 				n => n as usize
 			};
 			let mut buf = Vec::with_capacity(amt);
-			let mut passwd: passwd = mem::zeroed();
+			let mut passwd: passwd = unsafe { mem::zeroed() };
 			let mut result = ptr::null_mut();
-			match getpwuid_r(getuid(), &mut passwd, buf.as_mut_ptr(), buf.capacity(), &mut result) {
+			match unsafe { getpwuid_r(getuid(), &mut passwd, buf.as_mut_ptr(), buf.capacity(), &mut result) } {
 				0 if !result.is_null() => {
 					let ptr = passwd.pw_dir as *const _;
-					let bytes = CStr::from_ptr(ptr).to_bytes();
+					let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
 					if bytes.is_empty() { None } else { Some(OsStringExt::from_vec(bytes.to_vec())) }
 				}
 				_ => None
@@ -174,7 +176,7 @@ mod unix {
 
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn cache_dir() -> Option<std::path::PathBuf> {
+fn cache_dir_default() -> Option<PathBuf> {
 	std::env::var_os("XDG_CACHE_HOME")
 		.and_then(self::unix::is_absolute_path)
 		.or_else(|| self::unix::home_dir().map(|h| h.join(".cache").join(PYKE_ROOT)))
@@ -182,6 +184,18 @@ pub fn cache_dir() -> Option<std::path::PathBuf> {
 
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn cache_dir() -> Option<std::path::PathBuf> {
+fn cache_dir_default() -> Option<PathBuf> {
 	self::unix::home_dir().map(|h| h.join("Library/Caches").join(PYKE_ROOT))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn cache_dir_default() -> Option<PathBuf> {
+	None
+}
+
+pub fn cache_dir() -> Option<PathBuf> {
+	#[cfg(miri)]
+	return Some(PathBuf::from("."));
+
+	std::env::var_os("ORT_CACHE_DIR").map(PathBuf::from).or_else(cache_dir_default)
 }

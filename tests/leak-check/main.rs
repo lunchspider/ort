@@ -1,15 +1,9 @@
 use ort::{
-	adapter::Adapter,
-	execution_providers::CPUExecutionProvider,
+	ep,
 	memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
-	operator::{
-		Operator, OperatorDomain,
-		io::{OperatorInput, OperatorOutput},
-		kernel::{Kernel, KernelAttributes, KernelContext}
-	},
-	session::{RunOptions, Session},
-	tensor::TensorElementType,
-	value::Tensor
+	operator::{Kernel, KernelAttributes, KernelContext, Operator, OperatorDomain, OperatorInput, OperatorOutput},
+	session::{Adapter, RunOptions, Session},
+	value::{Tensor, TensorElementType}
 };
 
 struct CustomOpOne;
@@ -77,7 +71,7 @@ impl Operator for CustomOpTwo {
 }
 
 fn main() -> ort::Result<()> {
-	let _env = ort::init().with_execution_providers([CPUExecutionProvider::default().build()]).commit()?;
+	ort::init().with_execution_providers([ep::CPU::default().build()]).commit();
 
 	let mut session = Session::builder()?
 		.with_operators(OperatorDomain::new("test.customop")?.add(CustomOpOne)?.add(CustomOpTwo)?)?
@@ -154,7 +148,7 @@ fn main() -> ort::Result<()> {
 		let mut binding = session.create_binding()?;
 		binding.bind_input("input_1", &value1)?;
 		binding.bind_input("input_2", &value2)?;
-		binding.bind_output_to_device("output", &Allocator::default().memory_info())?;
+		binding.bind_output_to_device("output", Allocator::default().memory_info())?;
 		let _ = session.run_binding(&binding)?;
 	}
 

@@ -1,6 +1,4 @@
-use alloc::boxed::Box;
-#[cfg(feature = "tracing")]
-use core::ptr;
+use alloc::sync::Arc;
 use core::{
 	ffi::{self, CStr},
 	marker::PhantomData,
@@ -78,7 +76,20 @@ pub(crate) use info;
 pub(crate) use trace;
 pub(crate) use warning;
 
-pub fn default_log_level() -> ort_sys::OrtLoggingLevel {
+macro_rules! create {
+	($name:ident, $ptr:expr) => {
+		$crate::trace!(target: "ort::lifetime", "+NEW {} @ {:p}", stringify!($name), $ptr);
+	};
+}
+macro_rules! drop {
+	($name:ident, $ptr:expr) => {
+		$crate::trace!(target: "ort::lifetime", "-DROP {} @ {:p}", stringify!($name), $ptr);
+	};
+}
+pub(crate) use create;
+pub(crate) use drop;
+
+pub(crate) fn default_log_level() -> ort_sys::OrtLoggingLevel {
 	#[cfg(feature = "std")]
 	match std::env::var("ORT_LOG").as_deref() {
 		Ok("fatal") => ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_FATAL,
@@ -102,11 +113,12 @@ pub(crate) extern "system" fn tracing_logger(
 	code_location: *const ffi::c_char,
 	message: *const ffi::c_char
 ) {
-	assert_ne!(code_location, ptr::null());
+	assert!(!code_location.is_null());
+	assert!(!message.is_null());
+	assert!(!id.is_null());
+
 	let code_location = unsafe { CStr::from_ptr(code_location) }.to_str().unwrap_or("<decode error>");
-	assert_ne!(message, ptr::null());
 	let message = unsafe { CStr::from_ptr(message) }.to_str().unwrap_or("<decode error>");
-	assert_ne!(id, ptr::null());
 	let id = unsafe { CStr::from_ptr(id) }.to_str().unwrap_or("<decode error>");
 
 	let span = tracing::span!(tracing::Level::TRACE, "ort", id = id, location = code_location);
@@ -122,7 +134,7 @@ pub(crate) extern "system" fn tracing_logger(
 
 /// `LoggerFunction` accepts the message's [`LogLevel`], its category, log ID, code location, and the message
 /// itself.
-pub type LoggerFunction = Box<dyn Fn(LogLevel, &str, &str, &str, &str) + Sync>;
+pub type LoggerFunction = Arc<dyn Fn(LogLevel, &str, &str, &str, &str) + Send + Sync>;
 
 pub(crate) extern "system" fn custom_logger(
 	logger: *mut ffi::c_void,
@@ -198,7 +210,7 @@ impl<'a> AsPointer for Logger<'a> {
 /// Logs a message to a given [`Logger`].
 ///
 /// ```
-/// # use ort::operator::kernel::{Kernel, KernelContext};
+/// # use ort::operator::{Kernel, KernelContext};
 /// struct MyKernel;
 ///
 /// impl Kernel for MyKernel {

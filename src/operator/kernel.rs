@@ -12,10 +12,8 @@ use crate::{
 	logging::Logger,
 	memory::{Allocator, MemoryInfo, MemoryType},
 	ortsys,
-	session::{Input, Output},
-	tensor::Shape,
 	util::with_cstr,
-	value::{DowncastableTarget, DynValue, Value, ValueRef, ValueRefMut, ValueType}
+	value::{DowncastableTarget, DynValue, IntoShape, Outlet, Value, ValueRef, ValueRefMut, ValueType}
 };
 
 pub trait Kernel {
@@ -45,7 +43,7 @@ impl KernelAttributes {
 		with_cstr(name.as_ref().as_bytes(), &|name| unsafe { T::from_info(self.ptr.as_ptr(), name.as_ptr()) }).ok()
 	}
 
-	pub fn inputs(&self) -> Result<Vec<Input>> {
+	pub fn inputs(&self) -> Result<Vec<Outlet>> {
 		let mut num_inputs = 0;
 		ortsys![unsafe KernelInfo_GetInputCount(self.ptr.as_ptr(), &mut num_inputs)?];
 
@@ -58,13 +56,13 @@ impl KernelAttributes {
 			let name = CString::from_vec_with_nul(name)?.into_string()?;
 			let mut type_info = ptr::null_mut();
 			ortsys![unsafe KernelInfo_GetInputTypeInfo(self.ptr.as_ptr(), idx, &mut type_info)?; nonNull(type_info)];
-			let input_type = unsafe { ValueType::from_type_info(type_info) };
-			inputs.push(Input { name, input_type })
+			let dtype = unsafe { ValueType::from_type_info(type_info) };
+			inputs.push(Outlet::new(name, dtype))
 		}
 		Ok(inputs)
 	}
 
-	pub fn outputs(&self) -> Result<Vec<Output>> {
+	pub fn outputs(&self) -> Result<Vec<Outlet>> {
 		let mut num_outputs = 0;
 		ortsys![unsafe KernelInfo_GetOutputCount(self.ptr.as_ptr(), &mut num_outputs)?];
 
@@ -77,8 +75,8 @@ impl KernelAttributes {
 			let name = CString::from_vec_with_nul(name)?.into_string()?;
 			let mut type_info = ptr::null_mut();
 			ortsys![unsafe KernelInfo_GetOutputTypeInfo(self.ptr.as_ptr(), idx, &mut type_info)?; nonNull(type_info)];
-			let output_type = unsafe { ValueType::from_type_info(type_info) };
-			outputs.push(Output { name, output_type })
+			let dtype = unsafe { ValueType::from_type_info(type_info) };
+			outputs.push(Outlet::new(name, dtype))
 		}
 		Ok(outputs)
 	}
@@ -106,6 +104,8 @@ impl KernelAttributes {
 		Ok(CString::from_vec_with_nul(name)?.into_string()?)
 	}
 
+	#[cfg(feature = "api-18")]
+	#[cfg_attr(docsrs, doc(cfg(feature = "api-18")))]
 	pub fn allocator(&self, mem_type: MemoryType) -> Result<Allocator> {
 		let mut ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
 		ortsys![unsafe KernelInfoGetAllocator(self.ptr.as_ptr(), mem_type.into(), &mut ptr)?; nonNull(ptr)];
@@ -121,12 +121,10 @@ impl KernelAttributes {
 
 impl Clone for KernelAttributes {
 	fn clone(&self) -> Self {
-		let mut out = ptr::null_mut();
-		ortsys![unsafe CopyKernelInfo(self.ptr.as_ptr(), &mut out).expect("failed to clone KernelAttributes")];
-		Self {
-			ptr: NonNull::new(out).expect("failed to clone KernelAttributes"),
-			should_release: true
-		}
+		let mut ptr = ptr::null_mut();
+		ortsys![unsafe CopyKernelInfo(self.ptr.as_ptr(), &mut ptr).expect("failed to clone KernelAttributes"); nonNull(ptr)];
+		crate::logging::create!(KernelAttributes, ptr);
+		Self { ptr, should_release: true }
 	}
 }
 
@@ -142,6 +140,7 @@ impl Drop for KernelAttributes {
 	fn drop(&mut self) {
 		if self.should_release {
 			ortsys![unsafe ReleaseKernelInfo(self.ptr.as_ptr())];
+			crate::logging::drop!(KernelAttributes, self.ptr);
 		}
 	}
 }
@@ -175,6 +174,7 @@ impl<T> Drop for ScratchBuffer<T> {
 		unsafe {
 			self.allocator.free(self.buffer);
 		}
+		crate::logging::drop!(ScratchBuffer, self.buffer);
 	}
 }
 
@@ -195,7 +195,7 @@ impl KernelContext {
 		Ok(NonNull::new(value_ptr.cast_mut()).map(|c| ValueRef::new(unsafe { Value::from_ptr_nodrop(c, None) })))
 	}
 
-	pub fn output(&self, idx: usize, shape: impl Into<Shape>) -> Result<Option<ValueRefMut<'_>>> {
+	pub fn output(&self, idx: usize, shape: impl IntoShape) -> Result<Option<ValueRefMut<'_>>> {
 		let mut value_ptr: *mut ort_sys::OrtValue = ptr::null_mut();
 		let shape = shape.into();
 		ortsys![unsafe KernelContext_GetOutput(self.ptr.as_ptr(), idx, shape.as_ptr(), shape.len(), &mut value_ptr)?];

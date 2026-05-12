@@ -8,13 +8,14 @@ use core::{
 
 use smallvec::SmallVec;
 
+#[cfg(feature = "api-20")]
+use crate::session::adapter::{Adapter, AdapterInner};
 use crate::{
 	AsPointer,
-	adapter::{Adapter, AdapterInner},
 	error::Result,
 	logging::LogLevel,
 	ortsys,
-	session::Output,
+	session::Outlet,
 	util::{MiniMap, STACK_SESSION_OUTPUTS, with_cstr},
 	value::{DynValue, Value, ValueTypeMarker}
 };
@@ -23,12 +24,12 @@ use crate::{
 ///
 /// ```
 /// # use std::sync::Arc;
-/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, memory::Allocator, value::Tensor};
+/// # use ort::{session::{Session, RunOptions, OutputSelector}, memory::Allocator, value::Tensor};
 /// # fn main() -> ort::Result<()> {
 /// let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 /// let input = Tensor::<f32>::new(&Allocator::default(), [1_usize, 64, 64, 3])?;
 ///
-/// let output0 = session.outputs[0].name.as_str();
+/// let output0 = session.outputs()[0].name();
 /// let options = RunOptions::new()?.with_outputs(
 /// 	// Disable all outputs...
 /// 	OutputSelector::no_default()
@@ -102,12 +103,12 @@ impl OutputSelector {
 	///
 	/// ```
 	/// # use std::sync::Arc;
-	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, memory::Allocator, value::Tensor};
+	/// # use ort::{session::{Session, RunOptions, OutputSelector}, memory::Allocator, value::Tensor};
 	/// # fn main() -> ort::Result<()> {
 	/// let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// let input = Tensor::<f32>::new(&Allocator::default(), [1_usize, 64, 64, 3])?;
 	///
-	/// let output0 = session.outputs[0].name.as_str();
+	/// let output0 = session.outputs()[0].name();
 	/// let options = RunOptions::new()?.with_outputs(
 	/// 	OutputSelector::default()
 	/// 		.preallocate(output0, Tensor::<f32>::new(&Allocator::default(), [1_usize, 128, 128, 3])?)
@@ -124,13 +125,13 @@ impl OutputSelector {
 
 	pub(crate) fn resolve_outputs<'a, 's: 'a>(
 		&'a self,
-		outputs: &'s [Output]
-	) -> (SmallVec<&'a str, { STACK_SESSION_OUTPUTS }>, SmallVec<Option<DynValue>, { STACK_SESSION_OUTPUTS }>) {
+		outputs: &'s [Outlet]
+	) -> (SmallVec<[&'a str; STACK_SESSION_OUTPUTS]>, SmallVec<[Option<DynValue>; STACK_SESSION_OUTPUTS]>) {
 		if self.use_defaults { outputs.iter() } else { [].iter() }
-			.map(|o| &o.name)
-			.filter(|n| !self.default_blocklist.contains(n))
-			.chain(self.allowlist.iter())
-			.map(|n| (n.as_str(), self.preallocated_outputs.get(n).map(DynValue::clone_of)))
+			.map(|o| o.name())
+			.filter(|n| !self.default_blocklist.iter().any(|e| e == n))
+			.chain(self.allowlist.iter().map(|x| x.as_str()))
+			.map(|n| (n, self.preallocated_outputs.get(n).map(DynValue::clone_of)))
 			.unzip()
 	}
 }
@@ -148,6 +149,7 @@ impl SelectedOutputMarker for HasSelectedOutputs {}
 pub(crate) struct UntypedRunOptions {
 	pub(crate) ptr: NonNull<ort_sys::OrtRunOptions>,
 	pub(crate) outputs: OutputSelector,
+	#[cfg(feature = "api-20")]
 	adapters: Vec<Arc<AdapterInner>>
 }
 
@@ -160,6 +162,13 @@ impl UntypedRunOptions {
 
 // https://onnxruntime.ai/docs/api/c/struct_ort_api.html#ac2a08cac0a657604bd5899e0d1a13675
 unsafe impl Send for UntypedRunOptions {}
+
+impl Drop for UntypedRunOptions {
+	fn drop(&mut self) {
+		ortsys![unsafe ReleaseRunOptions(self.ptr.as_ptr())];
+		crate::logging::drop!(RunOptions, self.ptr);
+	}
+}
 
 /// Allows for finer control over session inference.
 ///
@@ -186,10 +195,11 @@ unsafe impl Send for UntypedRunOptions {}
 /// [`Session::run_binding_with_options`]: crate::session::Session::run_binding_with_options
 #[derive(Debug)]
 pub struct RunOptions<O: SelectedOutputMarker = NoSelectedOutputs> {
-	pub(crate) inner: UntypedRunOptions,
+	pub(crate) inner: Arc<UntypedRunOptions>,
 	_marker: PhantomData<O>
 }
 
+unsafe impl<O: SelectedOutputMarker> Send for RunOptions<O> {}
 // Only allow `Sync` if we don't have (potentially pre-allocated) outputs selected.
 // Allowing `Sync` here would mean a single pre-allocated `Value` could be mutated simultaneously in different threads -
 // a brazen crime against crabkind.
@@ -198,14 +208,16 @@ unsafe impl Sync for RunOptions<NoSelectedOutputs> {}
 impl RunOptions {
 	/// Creates a new [`RunOptions`] struct.
 	pub fn new() -> Result<RunOptions<NoSelectedOutputs>> {
-		let mut run_options_ptr: *mut ort_sys::OrtRunOptions = ptr::null_mut();
-		ortsys![unsafe CreateRunOptions(&mut run_options_ptr)?; nonNull(run_options_ptr)];
+		let mut ptr: *mut ort_sys::OrtRunOptions = ptr::null_mut();
+		ortsys![unsafe CreateRunOptions(&mut ptr)?; nonNull(ptr)];
+		crate::logging::create!(RunOptions, ptr);
 		Ok(RunOptions {
-			inner: UntypedRunOptions {
-				ptr: run_options_ptr,
+			inner: Arc::new(UntypedRunOptions {
+				ptr,
 				outputs: OutputSelector::default(),
+				#[cfg(feature = "api-20")]
 				adapters: Vec::new()
-			},
+			}),
 			_marker: PhantomData
 		})
 	}
@@ -218,12 +230,12 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	///
 	/// ```
 	/// # use std::sync::Arc;
-	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, memory::Allocator, value::Tensor};
+	/// # use ort::{session::{Session, RunOptions, OutputSelector}, memory::Allocator, value::Tensor};
 	/// # fn main() -> ort::Result<()> {
 	/// let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// let input = Tensor::<f32>::new(&Allocator::default(), [1_usize, 64, 64, 3])?;
 	///
-	/// let output0 = session.outputs[0].name.as_str();
+	/// let output0 = session.outputs()[0].name();
 	/// let options = RunOptions::new()?.with_outputs(
 	/// 	// Disable all outputs...
 	/// 	OutputSelector::no_default()
@@ -239,7 +251,10 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// # }
 	/// ```
 	pub fn with_outputs(mut self, outputs: OutputSelector) -> RunOptions<HasSelectedOutputs> {
-		self.inner.outputs = outputs;
+		let Some(inner) = Arc::get_mut(&mut self.inner) else {
+			panic!("Expected RunOptions to have exclusive access");
+		};
+		inner.outputs = outputs;
 		unsafe { mem::transmute(self) }
 	}
 
@@ -270,7 +285,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// ```no_run
 	/// # // no_run because upsample.onnx is too simple of a model for the termination signal to be reliable enough
 	/// # use std::sync::Arc;
-	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, value::Value};
+	/// # use ort::{session::{Session, RunOptions, OutputSelector}, value::Value};
 	/// # fn main() -> ort::Result<()> {
 	/// # 	let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// # 	let input = Value::from_array(ndarray::Array4::<f32>::zeros((1, 64, 64, 3)))?;
@@ -298,7 +313,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	///
 	/// ```no_run
 	/// # use std::sync::Arc;
-	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, value::Value};
+	/// # use ort::{session::{Session, RunOptions, OutputSelector}, value::Value};
 	/// # fn main() -> ort::Result<()> {
 	/// # 	let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// # 	let input = Value::from_array(ndarray::Array4::<f32>::zeros((1, 64, 64, 3)))?;
@@ -327,7 +342,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// like CUDA:
 	/// ```no_run
 	/// # use std::sync::Arc;
-	/// # use ort::session::run_options::RunOptions;
+	/// # use ort::session::RunOptions;
 	/// # fn main() -> ort::Result<()> {
 	/// let mut run_options = RunOptions::new()?;
 	/// run_options.add_config_entry("gpu_graph_id", "1")?;
@@ -343,9 +358,14 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 		})
 	}
 
+	#[cfg(feature = "api-20")]
+	#[cfg_attr(docsrs, doc(cfg(feature = "api-20")))]
 	pub fn add_adapter(&mut self, adapter: &Adapter) -> Result<()> {
-		ortsys![unsafe RunOptionsAddActiveLoraAdapter(self.inner.ptr.as_ptr(), adapter.ptr())?];
-		self.inner.adapters.push(Arc::clone(&adapter.inner));
+		let Some(inner) = Arc::get_mut(&mut self.inner) else {
+			panic!("Expected RunOptions to have exclusive access");
+		};
+		ortsys![unsafe RunOptionsAddActiveLoraAdapter(inner.ptr.as_ptr(), adapter.ptr())?];
+		inner.adapters.push(Arc::clone(&adapter.inner));
 		Ok(())
 	}
 
@@ -381,11 +401,5 @@ impl<O: SelectedOutputMarker> AsPointer for RunOptions<O> {
 
 	fn ptr(&self) -> *const Self::Sys {
 		self.inner.ptr.as_ptr()
-	}
-}
-
-impl<O: SelectedOutputMarker> Drop for RunOptions<O> {
-	fn drop(&mut self) {
-		ortsys![unsafe ReleaseRunOptions(self.inner.ptr.as_ptr())];
 	}
 }

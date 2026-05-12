@@ -2,6 +2,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(clippy::type_complexity)]
+#![allow(clippy::missing_safety_doc)]
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 extern crate alloc;
@@ -11,15 +12,22 @@ extern crate core;
 #[cfg(feature = "std")]
 pub mod internal;
 pub mod stub;
+mod version;
 
-pub const ORT_API_VERSION: u32 = 22;
+#[cfg(link_error)]
+mod link_error;
 
 pub use core::ffi::{c_char, c_int, c_ulong, c_ulonglong, c_ushort, c_void};
 
+pub use self::version::ORT_API_VERSION;
+
 #[cfg(target_os = "windows")]
-pub type ortchar = c_ushort;
+pub type os_char = c_ushort;
 #[cfg(not(target_os = "windows"))]
-pub type ortchar = c_char;
+pub type os_char = c_char;
+
+#[deprecated = "use `os_char` instead"]
+pub type ortchar = os_char;
 
 #[repr(i32)]
 #[doc = " Copied from TensorProto::DataType\n Currently, Ort doesn't support complex64, complex128"]
@@ -303,6 +311,46 @@ pub struct OrtEpDevice {
 pub struct OrtKeyValuePairs {
 	_unused: [u8; 0]
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtSyncStream {
+	_unused: [u8; 0]
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtExternalInitializerInfo {
+	_unused: [u8; 0]
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtExternalResourceImporter {
+	_unused: [u8; 0]
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtExternalMemoryHandle {
+	_unused: [u8; 0]
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtExternalSemaphoreHandle {
+	_unused: [u8; 0]
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtDeviceEpIncompatibilityDetails {
+	_unused: [u8; 0]
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtEpAssignedSubgraph {
+	_unused: [u8; 0]
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtEpAssignedNode {
+	_unused: [u8; 0]
+}
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone)]
 #[must_use = "statuses must be freed with `OrtApi::ReleaseStatus` if they are not null"]
@@ -341,6 +389,7 @@ pub enum GraphOptimizationLevel {
 	ORT_DISABLE_ALL = 0,
 	ORT_ENABLE_BASIC = 1,
 	ORT_ENABLE_EXTENDED = 2,
+	ORT_ENABLE_LAYOUT = 3,
 	ORT_ENABLE_ALL = 99
 }
 #[repr(i32)]
@@ -380,6 +429,12 @@ pub enum OrtAllocatorType {
 }
 impl OrtMemType {
 	pub const OrtMemTypeCPU: OrtMemType = OrtMemType::OrtMemTypeCPUOutput;
+}
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum OrtDeviceMemoryType {
+	OrtDeviceMemoryType_DEFAULT = 0,
+	OrtDeviceMemoryType_HOST_ACCESSIBLE = 5
 }
 #[repr(i32)]
 #[doc = " \\brief Memory types for allocated memory, execution provider specific types should be extended in each provider."]
@@ -428,6 +483,16 @@ pub type EpSelectionDelegate = Option<
 		max_selected: usize,
 		num_selected: *mut usize,
 		state: *mut c_void
+	) -> OrtStatusPtr
+>;
+pub type OrtWriteBufferFunc = Option<unsafe extern "system" fn(state: *mut c_void, buffer: *const c_void, buffer_num_bytes: usize) -> OrtStatusPtr>;
+pub type OrtGetInitializerLocationFunc = Option<
+	unsafe extern "system" fn(
+		state: *mut c_void,
+		initializer_name: *const c_char,
+		initializer_value: *const OrtValue,
+		external_info: *const OrtExternalInitializerInfo,
+		new_external_info: *mut *mut OrtExternalInitializerInfo
 	) -> OrtStatusPtr
 >;
 #[repr(i32)]
@@ -523,6 +588,7 @@ pub struct OrtTensorRTProviderOptions {
 pub struct OrtMIGraphXProviderOptions {
 	pub device_id: core::ffi::c_int,
 	pub migraphx_fp16_enable: core::ffi::c_int,
+	pub migraphx_fp8_enable: core::ffi::c_int,
 	pub migraphx_int8_enable: core::ffi::c_int,
 	pub migraphx_use_native_calibration_table: core::ffi::c_int,
 	pub migraphx_int8_calibration_table_name: *const core::ffi::c_char,
@@ -530,7 +596,9 @@ pub struct OrtMIGraphXProviderOptions {
 	pub migraphx_save_model_path: *const core::ffi::c_char,
 	pub migraphx_load_compiled_model: core::ffi::c_int,
 	pub migraphx_load_model_path: *const core::ffi::c_char,
-	pub migraphx_exhaustive_tune: bool
+	pub migraphx_exhaustive_tune: bool,
+	pub migraphx_mem_limit: usize,
+	pub migraphx_arena_extend_strategy: core::ffi::c_int
 }
 #[doc = " \\brief OpenVINO Provider Options\n\n \\see OrtApi::SessionOptionsAppendExecutionProvider_OpenVINO"]
 #[repr(C)]
@@ -549,6 +617,41 @@ pub struct OrtOpenVINOProviderOptions {
 	pub enable_opencl_throttling: core::ffi::c_uchar,
 	#[doc = "< 0 = disabled, nonzero = enabled"]
 	pub enable_dynamic_shapes: core::ffi::c_uchar
+}
+#[repr(i32)]
+#[derive(Default, Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum OrtDmlPerformancePreference {
+	#[default]
+	Default = 0,
+	HighPerformance = 1,
+	MinimumPower = 2
+}
+#[repr(u32)]
+#[derive(Default, Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum OrtDmlDeviceFilter {
+	Any = 0xFFFF_FFFF,
+	#[default]
+	Gpu = 1 << 0,
+	Npu = 1 << 1
+}
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct OrtDmlDeviceOptions {
+	pub Preference: OrtDmlPerformancePreference,
+	pub Filter: OrtDmlDeviceFilter
+}
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct OrtDmlApi {
+	pub SessionOptionsAppendExecutionProvider_DML: unsafe extern "system" fn(options: *mut OrtSessionOptions, device_id: c_int) -> OrtStatusPtr,
+	pub SessionOptionsAppendExecutionProvider_DML1:
+		unsafe extern "system" fn(options: *mut OrtSessionOptions, dml_device: *mut c_void, cmd_queue: *mut c_void) -> OrtStatusPtr,
+	pub CreateGPUAllocationFromD3DResource: unsafe extern "system" fn(resource: *mut c_void, dml_resource: *mut *mut c_void) -> OrtStatusPtr,
+	pub FreeGPUAllocation: unsafe extern "system" fn(dml_resource: *mut c_void) -> OrtStatusPtr,
+	pub GetD3D12ResourceFromAllocation:
+		unsafe extern "system" fn(provider: *mut OrtAllocator, dml_resource: *mut c_void, d3d_resource: *mut *mut c_void) -> OrtStatusPtr,
+	pub SessionOptionsAppendExecutionProvider_DML2:
+		unsafe extern "system" fn(options: *mut OrtSessionOptions, device_opts: *const OrtDmlDeviceOptions) -> OrtStatusPtr
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -570,16 +673,16 @@ pub enum OrtPropertyType {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct OrtTrainingApi {
-	pub LoadCheckpoint: unsafe extern "system" fn(checkpoint_path: *const ortchar, checkpoint_state: *mut *mut OrtCheckpointState) -> OrtStatusPtr,
+	pub LoadCheckpoint: unsafe extern "system" fn(checkpoint_path: *const os_char, checkpoint_state: *mut *mut OrtCheckpointState) -> OrtStatusPtr,
 	pub SaveCheckpoint:
-		unsafe extern "system" fn(checkpoint_state: *mut OrtCheckpointState, checkpoint_path: *const ortchar, include_optimizer_state: bool) -> OrtStatusPtr,
+		unsafe extern "system" fn(checkpoint_state: *mut OrtCheckpointState, checkpoint_path: *const os_char, include_optimizer_state: bool) -> OrtStatusPtr,
 	pub CreateTrainingSession: unsafe extern "system" fn(
 		env: *const OrtEnv,
 		options: *const OrtSessionOptions,
 		checkpoint_state: *mut OrtCheckpointState,
-		train_model_path: *const ortchar,
-		eval_model_path: *const ortchar,
-		optimizer_model_path: *const ortchar,
+		train_model_path: *const os_char,
+		eval_model_path: *const os_char,
+		optimizer_model_path: *const os_char,
 		out: *mut *mut OrtTrainingSession
 	) -> OrtStatusPtr,
 	pub CreateTrainingSessionFromBuffer: unsafe extern "system" fn(
@@ -632,7 +735,7 @@ pub struct OrtTrainingApi {
 	pub ReleaseCheckpointState: unsafe extern "system" fn(input: *mut OrtCheckpointState),
 	pub ExportModelForInferencing: unsafe extern "system" fn(
 		session: *mut OrtTrainingSession,
-		inference_model_path: *const ortchar,
+		inference_model_path: *const os_char,
 		graph_outputs_len: usize,
 		graph_output_names: *const *const c_char
 	) -> OrtStatusPtr,
@@ -713,7 +816,7 @@ pub struct OrtModelEditorApi {
 	pub CreateSessionFromModel:
 		unsafe extern "system" fn(env: *const OrtEnv, model: *const OrtModel, options: *const OrtSessionOptions, out: *mut *mut OrtSession) -> OrtStatusPtr,
 	pub CreateModelEditorSession:
-		unsafe extern "system" fn(env: *const OrtEnv, model_path: *const ortchar, options: *const OrtSessionOptions, out: *mut *mut OrtSession) -> OrtStatusPtr,
+		unsafe extern "system" fn(env: *const OrtEnv, model_path: *const os_char, options: *const OrtSessionOptions, out: *mut *mut OrtSession) -> OrtStatusPtr,
 	pub CreateModelEditorSessionFromArray: unsafe extern "system" fn(
 		env: *const OrtEnv,
 		model_data: *const c_void,
@@ -736,17 +839,17 @@ pub struct OrtCompileApi {
 	pub CreateModelCompilationOptionsFromSessionOptions:
 		unsafe extern "system" fn(env: *const OrtEnv, session_options: *const OrtSessionOptions, out: *mut *mut OrtModelCompilationOptions) -> OrtStatusPtr,
 	pub ModelCompilationOptions_SetInputModelPath:
-		unsafe extern "system" fn(model_compile_options: *mut OrtModelCompilationOptions, input_model_path: *const ortchar) -> OrtStatusPtr,
+		unsafe extern "system" fn(model_compile_options: *mut OrtModelCompilationOptions, input_model_path: *const os_char) -> OrtStatusPtr,
 	pub ModelCompilationOptions_SetInputModelFromBuffer: unsafe extern "system" fn(
 		model_compile_options: *mut OrtModelCompilationOptions,
 		input_model_data: *const c_void,
 		input_model_data_size: usize
 	) -> OrtStatusPtr,
 	pub ModelCompilationOptions_SetOutputModelPath:
-		unsafe extern "system" fn(model_compile_options: *mut OrtModelCompilationOptions, output_model_path: *const ortchar) -> OrtStatusPtr,
+		unsafe extern "system" fn(model_compile_options: *mut OrtModelCompilationOptions, output_model_path: *const os_char) -> OrtStatusPtr,
 	pub ModelCompilationOptions_SetOutputModelExternalInitializersFile: unsafe extern "system" fn(
 		model_compile_options: *mut OrtModelCompilationOptions,
-		external_initializers_file_path: *const ortchar,
+		external_initializers_file_path: *const os_char,
 		external_initializers_size_threshold: usize
 	) -> OrtStatusPtr,
 	pub ModelCompilationOptions_SetOutputModelBuffer: unsafe extern "system" fn(
@@ -758,6 +861,11 @@ pub struct OrtCompileApi {
 	pub ModelCompilationOptions_SetEpContextEmbedMode:
 		unsafe extern "system" fn(model_compile_options: *mut OrtModelCompilationOptions, embed_ep_context_in_model: bool) -> OrtStatusPtr,
 	pub CompileModel: unsafe extern "system" fn(env: *const OrtEnv, model_options: *const OrtModelCompilationOptions) -> OrtStatusPtr
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtInteropApi {
+	_unused: [u8; 0]
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -773,7 +881,7 @@ pub struct OrtApiBase {
 	#[doc = " \\brief Returns a null terminated string of the version of the Onnxruntime library (eg: \"1.8.1\")\n\n  \\return UTF-8 encoded version string. Do not deallocate the returned buffer."]
 	pub GetVersionString: unsafe extern "system" fn() -> *const core::ffi::c_char
 }
-extern "system" {
+unsafe extern "system" {
 	#[doc = " \\brief The Onnxruntime library's entry point to access the C API\n\n Call this to get the a pointer to an ::OrtApiBase"]
 	pub fn OrtGetApiBase() -> *const OrtApiBase;
 }
@@ -795,12 +903,45 @@ pub type OrtCustomCreateThreadFn = Option<
 >;
 #[doc = " \\brief Custom thread join function\n\n Onnxruntime thread pool destructor will call the function to join a custom thread.\n Argument ort_custom_thread_handle is the value returned by OrtCustomCreateThreadFn"]
 pub type OrtCustomJoinThreadFn = Option<unsafe extern "system" fn(ort_custom_thread_handle: OrtCustomThreadHandle)>;
+pub type OrtThreadPoolWorkEnqueueFn = Option<unsafe extern "system" fn(user_context: *mut c_void) -> *mut c_void>;
+pub type OrtThreadPoolWorkStartFn = Option<unsafe extern "system" fn(user_context: *mut c_void, enqueue_data: *mut c_void)>;
+pub type OrtThreadPoolWorkStopFn = Option<unsafe extern "system" fn(user_context: *mut c_void, enqueue_data: *mut c_void)>;
+pub type OrtThreadPoolWorkAbandonFn = Option<unsafe extern "system" fn(user_context: *mut c_void, enqueue_data: *mut c_void)>;
+#[repr(C)]
+#[derive(Default, Debug, Clone)]
+pub struct OrtThreadPoolCallbacksConfig {
+	version: u32,
+	on_enqueue: OrtThreadPoolWorkEnqueueFn,
+	on_start_work: OrtThreadPoolWorkStartFn,
+	on_stop_work: OrtThreadPoolWorkStopFn,
+	on_abandon: OrtThreadPoolWorkAbandonFn,
+	user_context: *mut c_void
+}
 #[doc = " \\brief Callback function for RunAsync\n\n \\param[in] user_data User specific data that passed back to the callback\n \\param[out] outputs On succeed, outputs host inference results, on error, the value will be nullptr\n \\param[out] num_outputs Number of outputs, on error, the value will be zero\n \\param[out] status On error, status will provide details"]
 pub type RunAsyncCallbackFn =
 	Option<unsafe extern "system" fn(user_data: *mut core::ffi::c_void, outputs: *mut *mut OrtValue, num_outputs: usize, status: OrtStatusPtr)>;
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum OrtCompiledModelCompatibility {
+	EP_NOT_APPLICABLE = 0,
+	EP_SUPPORTED_OPTIMAL,
+	EP_SUPPORTED_PREFER_RECOMPILATION,
+	EP_UNSUPPORTED
+}
+#[repr(C)]
+#[derive(Default, Debug, Clone)]
+pub struct OrtEnvCreationOptions {
+	pub version: u32,
+	pub logging_severity_level: i32,
+	pub log_id: *const c_char,
+	pub custom_logging_function: Option<OrtLoggingFunction>,
+	pub custom_logging_param: *mut c_void,
+	pub threading_options: *const OrtThreadingOptions,
+	pub config_entries: *const OrtKeyValuePairs
+}
 #[doc = " \\brief The C API\n\n All C API functions are defined inside this structure as pointers to functions.\n Call OrtApiBase::GetApi to get a pointer to it\n\n \\nosubgrouping"]
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct OrtApi {
 	#[doc = " \\brief Create an OrtStatus from a null terminated string\n\n \\param[in] code\n \\param[in] msg A null-terminated string. Its contents will be copied.\n \\return A new OrtStatus object, must be destroyed with OrtApi::ReleaseStatus"]
 	pub CreateStatus: unsafe extern "system" fn(code: OrtErrorCode, msg: *const core::ffi::c_char) -> OrtStatusPtr,
@@ -820,7 +961,7 @@ pub struct OrtApi {
 	pub DisableTelemetryEvents: unsafe extern "system" fn(env: *const OrtEnv) -> OrtStatusPtr,
 	#[cfg(not(target_arch = "wasm32"))]
 	pub CreateSession:
-		unsafe extern "system" fn(env: *const OrtEnv, model_path: *const ortchar, options: *const OrtSessionOptions, out: *mut *mut OrtSession) -> OrtStatusPtr,
+		unsafe extern "system" fn(env: *const OrtEnv, model_path: *const os_char, options: *const OrtSessionOptions, out: *mut *mut OrtSession) -> OrtStatusPtr,
 	#[cfg(target_arch = "wasm32")]
 	pub CreateSession: unsafe fn(
 		env: *const OrtEnv,
@@ -854,10 +995,10 @@ pub struct OrtApi {
 		outputs: *mut *mut OrtValue
 	) -> OrtStatusPtr,
 	pub CreateSessionOptions: unsafe extern "system" fn(options: *mut *mut OrtSessionOptions) -> OrtStatusPtr,
-	pub SetOptimizedModelFilePath: unsafe extern "system" fn(options: *mut OrtSessionOptions, optimized_model_filepath: *const ortchar) -> OrtStatusPtr,
+	pub SetOptimizedModelFilePath: unsafe extern "system" fn(options: *mut OrtSessionOptions, optimized_model_filepath: *const os_char) -> OrtStatusPtr,
 	pub CloneSessionOptions: unsafe extern "system" fn(in_options: *const OrtSessionOptions, out_options: *mut *mut OrtSessionOptions) -> OrtStatusPtr,
 	pub SetSessionExecutionMode: unsafe extern "system" fn(options: *mut OrtSessionOptions, execution_mode: ExecutionMode) -> OrtStatusPtr,
-	pub EnableProfiling: unsafe extern "system" fn(options: *mut OrtSessionOptions, profile_file_prefix: *const ortchar) -> OrtStatusPtr,
+	pub EnableProfiling: unsafe extern "system" fn(options: *mut OrtSessionOptions, profile_file_prefix: *const os_char) -> OrtStatusPtr,
 	pub DisableProfiling: unsafe extern "system" fn(options: *mut OrtSessionOptions) -> OrtStatusPtr,
 	pub EnableMemPattern: unsafe extern "system" fn(options: *mut OrtSessionOptions) -> OrtStatusPtr,
 	pub DisableMemPattern: unsafe extern "system" fn(options: *mut OrtSessionOptions) -> OrtStatusPtr,
@@ -1137,7 +1278,7 @@ pub struct OrtApi {
 	pub ReleasePrepackedWeightsContainer: unsafe extern "system" fn(input: *mut OrtPrepackedWeightsContainer),
 	pub CreateSessionWithPrepackedWeightsContainer: unsafe extern "system" fn(
 		env: *const OrtEnv,
-		model_path: *const ortchar,
+		model_path: *const os_char,
 		options: *const OrtSessionOptions,
 		prepacked_weights_container: *mut OrtPrepackedWeightsContainer,
 		out: *mut *mut OrtSession
@@ -1335,7 +1476,7 @@ pub struct OrtApi {
 	pub UpdateEnvWithCustomLogLevel: unsafe extern "system" fn(ort_env: *mut OrtEnv, log_severity_level: OrtLoggingLevel) -> OrtStatusPtr,
 	pub SetGlobalIntraOpThreadAffinity:
 		unsafe extern "system" fn(tp_options: *mut OrtThreadingOptions, affinity_string: *const core::ffi::c_char) -> OrtStatusPtr,
-	pub RegisterCustomOpsLibrary_V2: unsafe extern "system" fn(options: *mut OrtSessionOptions, library_name: *const ortchar) -> OrtStatusPtr,
+	pub RegisterCustomOpsLibrary_V2: unsafe extern "system" fn(options: *mut OrtSessionOptions, library_name: *const os_char) -> OrtStatusPtr,
 	pub RegisterCustomOpsUsingFunction:
 		unsafe extern "system" fn(options: *mut OrtSessionOptions, registration_func_name: *const core::ffi::c_char) -> OrtStatusPtr,
 	pub KernelInfo_GetInputCount: unsafe extern "system" fn(info: *const OrtKernelInfo, out: *mut usize) -> OrtStatusPtr,
@@ -1380,7 +1521,7 @@ pub struct OrtApi {
 		logger: *const OrtLogger,
 		log_severity_level: OrtLoggingLevel,
 		message: *const core::ffi::c_char,
-		file_path: *const ortchar,
+		file_path: *const os_char,
 		line_number: core::ffi::c_int,
 		func_name: *const core::ffi::c_char
 	) -> OrtStatusPtr,
@@ -1490,49 +1631,66 @@ pub struct OrtApi {
 		provider_options_values: *const *const core::ffi::c_char,
 		num_keys: usize
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-18")]
 	pub SessionOptionsAppendExecutionProvider_VitisAI: unsafe extern "system" fn(
 		options: *mut OrtSessionOptions,
 		provider_options_keys: *const *const core::ffi::c_char,
 		provider_options_values: *const *const core::ffi::c_char,
 		num_keys: usize
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-18")]
 	pub KernelContext_GetScratchBuffer: unsafe extern "system" fn(
 		context: *const OrtKernelContext,
 		mem_info: *const OrtMemoryInfo,
 		count_or_bytes: usize,
 		out: *mut *mut core::ffi::c_void
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-18")]
 	pub KernelInfoGetAllocator: unsafe extern "system" fn(info: *const OrtKernelInfo, mem_type: OrtMemType, out: *mut *mut OrtAllocator) -> OrtStatusPtr,
+	#[cfg(feature = "api-18")]
 	pub AddExternalInitializersFromMemory: unsafe extern "system" fn(
 		options: *mut OrtSessionOptions,
-		external_initializer_file_names: *const *const ortchar,
+		external_initializer_file_names: *const *const os_char,
 		external_initializer_file_buffer_array: *const *mut core::ffi::c_char,
 		external_initializer_file_lengths: *const usize,
 		num_external_initializer_files: usize
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-20")]
 	pub CreateLoraAdapter:
-		unsafe extern "system" fn(adapter_file_path: *const ortchar, allocator: *mut OrtAllocator, out: *mut *mut OrtLoraAdapter) -> OrtStatusPtr,
+		unsafe extern "system" fn(adapter_file_path: *const os_char, allocator: *mut OrtAllocator, out: *mut *mut OrtLoraAdapter) -> OrtStatusPtr,
+	#[cfg(feature = "api-20")]
 	pub CreateLoraAdapterFromArray: unsafe extern "system" fn(
 		bytes: *const core::ffi::c_void,
 		num_bytes: usize,
 		allocator: *mut OrtAllocator,
 		out: *mut *mut OrtLoraAdapter
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-20")]
 	pub ReleaseLoraAdapter: unsafe extern "system" fn(input: *mut OrtLoraAdapter),
+	#[cfg(feature = "api-20")]
 	pub RunOptionsAddActiveLoraAdapter: unsafe extern "system" fn(options: *mut OrtRunOptions, adapter: *const OrtLoraAdapter) -> OrtStatusPtr,
+	#[cfg(feature = "api-20")]
 	pub SetEpDynamicOptions: unsafe extern "system" fn(
 		sess: *mut OrtSession,
 		keys: *const *const core::ffi::c_char,
 		values: *const *const core::ffi::c_char,
 		kv_len: usize
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub ReleaseValueInfo: unsafe extern "system" fn(input: *mut OrtValueInfo),
+	#[cfg(feature = "api-22")]
 	pub ReleaseNode: unsafe extern "system" fn(input: *mut OrtNode),
+	#[cfg(feature = "api-22")]
 	pub ReleaseGraph: unsafe extern "system" fn(input: *mut OrtGraph),
+	#[cfg(feature = "api-22")]
 	pub ReleaseModel: unsafe extern "system" fn(input: *mut OrtModel),
+	#[cfg(feature = "api-22")]
 	pub GetValueInfoName: unsafe extern "system" fn(value_info: *const OrtValueInfo, name: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub GetValueInfoTypeInfo: unsafe extern "system" fn(value_info: *const OrtValueInfo, type_info: *mut *const OrtTypeInfo) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub GetModelEditorApi: unsafe extern "system" fn() -> *const OrtModelEditorApi,
+	#[cfg(feature = "api-22")]
 	pub CreateTensorWithDataAndDeleterAsOrtValue: unsafe extern "system" fn(
 		deleter: *mut OrtAllocator,
 		p_data: *mut c_void,
@@ -1542,18 +1700,30 @@ pub struct OrtApi {
 		r#type: ONNXTensorElementDataType,
 		out: *mut *mut OrtValue
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub SessionOptionsSetLoadCancellationFlag: unsafe extern "system" fn(options: *mut OrtSessionOptions, cancel: bool) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub GetCompileApi: unsafe extern "system" fn() -> *const OrtCompileApi,
+	#[cfg(feature = "api-22")]
 	pub CreateKeyValuePairs: unsafe extern "system" fn(out: *mut *mut OrtKeyValuePairs),
+	#[cfg(feature = "api-22")]
 	pub AddKeyValuePair: unsafe extern "system" fn(kvps: *mut OrtKeyValuePairs, key: *const c_char, value: *const c_char),
+	#[cfg(feature = "api-22")]
 	pub GetKeyValue: unsafe extern "system" fn(kvps: *const OrtKeyValuePairs, key: *const c_char) -> *const c_char,
+	#[cfg(feature = "api-22")]
 	pub GetKeyValuePairs:
 		unsafe extern "system" fn(kvps: *const OrtKeyValuePairs, keys: *mut *const *const c_char, values: *mut *const *const c_char, num_entries: *mut usize),
+	#[cfg(feature = "api-22")]
 	pub RemoveKeyValuePair: unsafe extern "system" fn(kvps: *mut OrtKeyValuePairs, key: *const c_char),
+	#[cfg(feature = "api-22")]
 	pub ReleaseKeyValuePairs: unsafe extern "system" fn(input: *mut OrtKeyValuePairs),
-	pub RegisterExecutionProviderLibrary: unsafe extern "system" fn(env: *mut OrtEnv, registration_name: *const c_char, path: *const ortchar) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
+	pub RegisterExecutionProviderLibrary: unsafe extern "system" fn(env: *mut OrtEnv, registration_name: *const c_char, path: *const os_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub UnregisterExecutionProviderLibrary: unsafe extern "system" fn(env: *mut OrtEnv, registration_name: *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub GetEpDevices: unsafe extern "system" fn(env: *const OrtEnv, ep_devices: *mut *const *const OrtEpDevice, num_ep_devices: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub SessionOptionsAppendExecutionProvider_V2: unsafe extern "system" fn(
 		session_options: *mut OrtSessionOptions,
 		env: *mut OrtEnv,
@@ -1563,21 +1733,318 @@ pub struct OrtApi {
 		ep_option_vals: *const *const c_char,
 		num_ep_options: usize
 	) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub SessionOptionsSetEpSelectionPolicy:
 		unsafe extern "system" fn(session_options: *mut OrtSessionOptions, policy: OrtExecutionProviderDevicePolicy) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub SessionOptionsSetEpSelectionPolicyDelegate:
 		unsafe extern "system" fn(session_options: *mut OrtSessionOptions, delegate: EpSelectionDelegate, delegate_state: *mut c_void) -> OrtStatusPtr,
+	#[cfg(feature = "api-22")]
 	pub HardwareDevice_Type: unsafe extern "system" fn(device: *const OrtHardwareDevice) -> OrtHardwareDeviceType,
+	#[cfg(feature = "api-22")]
 	pub HardwareDevice_VendorId: unsafe extern "system" fn(device: *const OrtHardwareDevice) -> u32,
+	#[cfg(feature = "api-22")]
 	pub HardwareDevice_Vendor: unsafe extern "system" fn(device: *const OrtHardwareDevice) -> *const c_char,
+	#[cfg(feature = "api-22")]
 	pub HardwareDevice_DeviceId: unsafe extern "system" fn(device: *const OrtHardwareDevice) -> u32,
+	#[cfg(feature = "api-22")]
 	pub HardwareDevice_Metadata: unsafe extern "system" fn(device: *const OrtHardwareDevice) -> *const OrtKeyValuePairs,
+	#[cfg(feature = "api-22")]
 	pub EpDevice_EpName: unsafe extern "system" fn(ep_device: *const OrtEpDevice) -> *const c_char,
+	#[cfg(feature = "api-22")]
 	pub EpDevice_EpVendor: unsafe extern "system" fn(ep_device: *const OrtEpDevice) -> *const c_char,
+	#[cfg(feature = "api-22")]
 	pub EpDevice_EpMetadata: unsafe extern "system" fn(ep_device: *const OrtEpDevice) -> *const OrtKeyValuePairs,
+	#[cfg(feature = "api-22")]
 	pub EpDevice_EpOptions: unsafe extern "system" fn(ep_device: *const OrtEpDevice) -> *const OrtKeyValuePairs,
+	#[cfg(feature = "api-22")]
 	pub EpDevice_Device: unsafe extern "system" fn(ep_device: *const OrtEpDevice) -> *const OrtHardwareDevice,
-	pub GetEpApi: unsafe extern "system" fn() -> *const OrtEpApi
+	#[cfg(feature = "api-22")]
+	pub GetEpApi: unsafe extern "system" fn() -> *const OrtEpApi,
+	#[cfg(feature = "api-23")]
+	pub GetTensorSizeInBytes: unsafe extern "system" fn(ort_value: *const OrtValue, size: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub AllocatorGetStats: unsafe extern "system" fn(ort_allocator: *const OrtAllocator, out: *mut *mut OrtKeyValuePairs) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub CreateMemoryInfo_V2: unsafe extern "system" fn(
+		name: *const c_char,
+		device_type: OrtMemoryInfoDeviceType,
+		vendor_id: u32,
+		device_id: i32,
+		mem_type: OrtDeviceMemoryType,
+		alignment: usize,
+		allocator_type: OrtAllocatorType,
+		out: *mut *mut OrtMemoryInfo
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub MemoryInfoGetDeviceMemType: unsafe extern "system" fn(ptr: *const OrtMemoryInfo) -> OrtDeviceMemoryType,
+	#[cfg(feature = "api-23")]
+	pub MemoryInfoGetVendorId: unsafe extern "system" fn(ptr: *const OrtMemoryInfo) -> u32,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_GetValueProducer:
+		unsafe extern "system" fn(value_info: *const OrtValueInfo, producer_node: *mut *const OrtNode, producer_output_index: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_GetValueNumConsumers: unsafe extern "system" fn(value_info: *const OrtValueInfo, num_consumers: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_GetValueConsumers:
+		unsafe extern "system" fn(value_info: *const OrtValueInfo, nodes: *mut *const OrtNode, input_indices: *mut i64, num_consumers: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_GetInitializerValue: unsafe extern "system" fn(value_info: *const OrtValueInfo, initializer_value: *mut *const OrtValue) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_GetExternalInitializerInfo:
+		unsafe extern "system" fn(value_info: *const OrtValueInfo, info: *mut *mut OrtExternalInitializerInfo) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_IsRequiredGraphInput: unsafe extern "system" fn(value_info: *const OrtValueInfo, is_required_graph_input: *mut bool) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_IsOptionalGraphInput: unsafe extern "system" fn(value_info: *const OrtValueInfo, is_optional_graph_input: *mut bool) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_IsGraphOutput: unsafe extern "system" fn(value_info: *const OrtValueInfo, is_graph_output: *mut bool) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_IsConstantInitializer: unsafe extern "system" fn(value_info: *const OrtValueInfo, is_constant_initializer: *mut bool) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ValueInfo_IsFromOuterScope: unsafe extern "system" fn(value_info: *const OrtValueInfo, is_from_outer_scope: *mut bool) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetName: unsafe extern "system" fn(graph: *const OrtGraph, graph_name: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetModelPath: unsafe extern "system" fn(graph: *const OrtGraph, model_path: *mut *const os_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetOnnxIRVersion: unsafe extern "system" fn(graph: *const OrtGraph, onnx_ir_version: *mut i64) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetNumOperatorSets: unsafe extern "system" fn(graph: *const OrtGraph, num_operator_sets: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetOperatorSets:
+		unsafe extern "system" fn(graph: *const OrtGraph, domains: *mut *const c_char, opset_versions: *mut i64, num_operator_sets: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetNumInputs: unsafe extern "system" fn(graph: *const OrtGraph, num_inputs: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetInputs: unsafe extern "system" fn(graph: *const OrtGraph, inputs: *mut *const OrtValueInfo, num_inputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetNumOutputs: unsafe extern "system" fn(graph: *const OrtGraph, num_outputs: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetOutputs: unsafe extern "system" fn(graph: *const OrtGraph, outputs: *mut *const OrtValueInfo, num_outputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetNumInitializers: unsafe extern "system" fn(graph: *const OrtGraph, num_initializers: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetInitializers:
+		unsafe extern "system" fn(graph: *const OrtGraph, initializers: *mut *const OrtValueInfo, num_initializers: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetNumNodes: unsafe extern "system" fn(graph: *const OrtGraph, num_nodes: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetNodes: unsafe extern "system" fn(graph: *const OrtGraph, nodes: *mut *const OrtNode, num_nodes: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetParentNode: unsafe extern "system" fn(graph: *const OrtGraph, node: *mut *const OrtNode) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetGraphView:
+		unsafe extern "system" fn(src_graph: *const OrtGraph, nodes: *mut *const OrtNode, num_nodes: usize, dst_graph: *mut *mut OrtGraph) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetId: unsafe extern "system" fn(node: *const OrtNode, node_id: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetName: unsafe extern "system" fn(node: *const OrtNode, node_name: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetOperatorType: unsafe extern "system" fn(node: *const OrtNode, operator_type: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetDomain: unsafe extern "system" fn(node: *const OrtNode, domain_name: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetSinceVersion: unsafe extern "system" fn(node: *const OrtNode, since_version: *mut i32) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetNumInputs: unsafe extern "system" fn(node: *const OrtNode, num_inputs: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetInputs: unsafe extern "system" fn(node: *const OrtNode, inputs: *mut *const OrtValueInfo, num_inputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetNumOutputs: unsafe extern "system" fn(node: *const OrtNode, num_outputs: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetOutputs: unsafe extern "system" fn(node: *const OrtNode, outputs: *mut *const OrtValueInfo, num_outputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetNumImplicitInputs: unsafe extern "system" fn(node: *const OrtNode, num_implicit_inputs: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetImplicitInputs:
+		unsafe extern "system" fn(node: *const OrtNode, implicit_inputs: *mut *const OrtValueInfo, num_implicit_inputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetNumAttributes: unsafe extern "system" fn(node: *const OrtNode, num_attributes: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetAttributes: unsafe extern "system" fn(node: *const OrtNode, attributes: *mut *const OrtOpAttr, num_attributes: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetAttributeByName:
+		unsafe extern "system" fn(node: *const OrtNode, attribute_name: *const c_char, attribute: *mut *const OrtOpAttr) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub OpAttr_GetTensorAttributeAsOrtValue: unsafe extern "system" fn(attribute: *const OrtOpAttr, attr_tensor: *mut *mut OrtValue) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub OpAttr_GetType: unsafe extern "system" fn(attribute: *const OrtOpAttr, r#type: *mut OrtOpAttrType) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub OpAttr_GetName: unsafe extern "system" fn(attribute: *const OrtOpAttr, name: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetNumSubgraphs: unsafe extern "system" fn(node: *const OrtNode, num_subgraphs: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetSubgraphs: unsafe extern "system" fn(
+		node: *const OrtNode,
+		subgraphs: *mut *const OrtGraph,
+		num_subgraphs: *mut usize,
+		attribute_names: *mut *const c_char
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetGraph: unsafe extern "system" fn(node: *const OrtNode, graph: *mut *const OrtGraph) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Node_GetEpName: unsafe extern "system" fn(node: *const OrtNode, out: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ReleaseExternalInitializerInfo: unsafe extern "system" fn(value: *mut OrtExternalInitializerInfo),
+	#[cfg(feature = "api-23")]
+	pub ExternalInitializerInfo_GetFilePath: unsafe extern "system" fn(info: *const OrtExternalInitializerInfo) -> *const os_char,
+	#[cfg(feature = "api-23")]
+	pub ExternalInitializerInfo_GetFileOffset: unsafe extern "system" fn(info: *const OrtExternalInitializerInfo) -> i64,
+	#[cfg(feature = "api-23")]
+	pub ExternalInitializerInfo_GetByteSize: unsafe extern "system" fn(info: *const OrtExternalInitializerInfo) -> usize,
+	#[cfg(feature = "api-23")]
+	pub GetRunConfigEntry: unsafe extern "system" fn(options: *const OrtRunOptions, config_key: *const c_char) -> *const c_char,
+	#[cfg(feature = "api-23")]
+	pub EpDevice_MemoryInfo: unsafe extern "system" fn(ep_device: *const OrtEpDevice, memory_type: OrtDeviceMemoryType) -> *const OrtMemoryInfo,
+	#[cfg(feature = "api-23")]
+	pub CreateSharedAllocator: unsafe extern "system" fn(
+		env: *mut OrtEnv,
+		ep_device: *const OrtEpDevice,
+		mem_type: OrtDeviceMemoryType,
+		allocator_type: OrtAllocatorType,
+		allocator_options: *const OrtKeyValuePairs,
+		allocator: *mut *mut OrtAllocator
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub GetSharedAllocator: unsafe extern "system" fn(env: *mut OrtEnv, mem_info: *const OrtMemoryInfo, allocator: *mut *mut OrtAllocator) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub ReleaseSharedAllocator: unsafe extern "system" fn(env: *mut OrtEnv, ep_device: *const OrtEpDevice, mem_type: OrtDeviceMemoryType) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub GetTensorData: unsafe extern "system" fn(value: *const OrtValue, out: *mut *const c_void) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub GetSessionOptionsConfigEntries: unsafe extern "system" fn(options: *const OrtSessionOptions, out: *mut *mut OrtKeyValuePairs) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub SessionGetMemoryInfoForInputs:
+		unsafe extern "system" fn(session: *const OrtSession, inputs_memory_info: *mut *const OrtMemoryInfo, num_inputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub SessionGetMemoryInfoForOutputs:
+		unsafe extern "system" fn(session: *const OrtSession, outputs_memory_info: *mut *const OrtMemoryInfo, num_outputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub SessionGetEpDeviceForInputs:
+		unsafe extern "system" fn(session: *const OrtSession, inputs_ep_devices: *mut *const OrtEpDevice, num_inputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub CreateSyncStreamForEpDevice:
+		unsafe extern "system" fn(ep_device: *const OrtEpDevice, stream_options: *const OrtKeyValuePairs, stream: *mut *mut OrtSyncStream) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub SyncStream_GetHandle: unsafe extern "system" fn(stream: *mut OrtSyncStream) -> *mut c_void,
+	#[cfg(feature = "api-23")]
+	pub ReleaseSyncStream: unsafe extern "system" fn(value: *mut OrtSyncStream),
+	#[cfg(feature = "api-23")]
+	pub CopyTensors: unsafe extern "system" fn(
+		env: *mut OrtEnv,
+		src_tensors: *const *const OrtValue,
+		dst_tensors: *mut *const OrtValue,
+		stream: *mut OrtSyncStream,
+		num_tensors: usize
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub Graph_GetModelMetadata: unsafe extern "system" fn(graph: *mut OrtGraph, out: *mut *mut OrtModelMetadata) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub GetModelCompatibilityForEpDevices: unsafe extern "system" fn(
+		ep_devices: *const *const OrtEpDevice,
+		num_ep_devices: usize,
+		compatibility_info: *const c_char,
+		out_status: *mut OrtCompiledModelCompatibility
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-23")]
+	pub CreateExternalInitializerInfo:
+		unsafe extern "system" fn(filepath: *const os_char, file_offset: i64, byte_size: usize, out: *mut *mut OrtExternalInitializerInfo) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub TensorTypeAndShape_HasShape: unsafe extern "system" fn(info: *const OrtTensorTypeAndShapeInfo) -> bool,
+	#[cfg(feature = "api-24")]
+	pub KernelInfo_GetConfigEntries: unsafe extern "system" fn(info: *const OrtKernelInfo, out: *mut *mut OrtKeyValuePairs) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub KernelInfo_GetOperatorDomain: unsafe extern "system" fn(info: *const OrtKernelInfo, out: *mut c_char, size: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub KernelInfo_GetOperatorType: unsafe extern "system" fn(info: *const OrtKernelInfo, out: *mut c_char, size: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub GetInteropApi: unsafe extern "system" fn() -> *const OrtInteropApi,
+	#[cfg(feature = "api-24")]
+	pub SessionGetEpDeviceForOutputs:
+		unsafe extern "system" fn(session: *const OrtSession, outputs_ep_devices: *mut *const OrtEpDevice, num_outputs: usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub GetNumHardwareDevices: unsafe extern "system" fn(env: *const OrtEnv, num_devices: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub GetHardwareDevices: unsafe extern "system" fn(env: *const OrtEnv, devices: *mut *const OrtHardwareDevice, num_devices: *mut usize) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub GetHardwareDeviceEpIncompatibilityDetails: unsafe extern "system" fn(
+		env: *const OrtEnv,
+		ep_name: *const c_char,
+		hw: *const OrtHardwareDevice,
+		details: *mut *mut OrtDeviceEpIncompatibilityDetails
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub DeviceEpIncompatibilityDetails_GetReasonsBitmask:
+		unsafe extern "system" fn(details: *const OrtDeviceEpIncompatibilityDetails, reasons_bitmask: *mut u32) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub DeviceEpIncompatibilityDetails_GetNotes:
+		unsafe extern "system" fn(details: *const OrtDeviceEpIncompatibilityDetails, notes: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub DeviceEpIncompatibilityDetails_GetErrorCode:
+		unsafe extern "system" fn(details: *const OrtDeviceEpIncompatibilityDetails, error_code: *mut i32) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub ReleaseDeviceEpIncompatibilityDetails: unsafe extern "system" fn(value: *mut OrtDeviceEpIncompatibilityDetails),
+	#[cfg(feature = "api-24")]
+	pub GetCompatibilityInfoFromModel: unsafe extern "system" fn(
+		model_path: *const os_char,
+		ep_type: *const c_char,
+		allocator: *mut OrtAllocator,
+		compatibility_info: *mut *mut c_char
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub GetCompatibilityInfoFromModelBytes: unsafe extern "system" fn(
+		model_data: *const c_void,
+		model_data_length: usize,
+		ep_type: *const c_char,
+		allocator: *mut OrtAllocator,
+		compatibility_info: *mut *mut c_char
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub CreateEnvWithOptions: unsafe extern "system" fn(options: *const OrtEnvCreationOptions, out: *mut *mut OrtEnv) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub Session_GetEpGraphAssignmentInfo: unsafe extern "system" fn(
+		session: *const OrtSession,
+		ep_subgraphs: *mut *const *const OrtEpAssignedSubgraph,
+		num_ep_subgraphs: *mut usize
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub EpAssignedSubgraph_GetEpName: unsafe extern "system" fn(ep_subgraph: *const OrtEpAssignedSubgraph, out: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub EpAssignedSubgraph_GetNodes: unsafe extern "system" fn(
+		ep_subgraph: *const OrtEpAssignedSubgraph,
+		ep_nodes: *mut *const *const OrtEpAssignedNode,
+		num_ep_nodes: *mut usize
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub EpAssignedNode_GetName: unsafe extern "system" fn(ep_node: *const OrtEpAssignedNode, out: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub EpAssignedNode_GetDomain: unsafe extern "system" fn(ep_node: *const OrtEpAssignedNode, out: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub EpAssignedNode_GetOperatorType: unsafe extern "system" fn(ep_node: *const OrtEpAssignedNode, out: *mut *const c_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-24")]
+	pub RunOptionsSetSyncStream: unsafe extern "system" fn(options: *mut OrtRunOptions, sync_stream: *mut OrtSyncStream),
+	#[cfg(feature = "api-24")]
+	pub GetTensorElementTypeAndShapeDataReference: unsafe extern "system" fn(
+		value: *const OrtValue,
+		elem_type: *mut ONNXTensorElementDataType,
+		shape_data: *mut *const i64,
+		shape_data_count: *mut usize
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-25")]
+	pub RunOptionsEnableProfiling: unsafe extern "system" fn(options: *mut OrtRunOptions, profile_file_prefix: *const os_char) -> OrtStatusPtr,
+	#[cfg(feature = "api-25")]
+	pub RunOptionsDisableProfiling: unsafe extern "system" fn(options: *mut OrtRunOptions) -> OrtStatusPtr,
+	#[cfg(feature = "api-25")]
+	pub KernelInfoGetAttributeArray_string: unsafe extern "system" fn(
+		info: *const OrtKernelInfo,
+		name: *const c_char,
+		allocator: *mut OrtAllocator,
+		out: *mut *mut *mut char,
+		size: *mut usize
+	) -> OrtStatusPtr,
+	#[cfg(feature = "api-25")]
+	pub SetPerSessionThreadPoolCallbacks: unsafe extern "system" fn(env: *mut OrtEnv, config: *const OrtThreadPoolCallbacksConfig) -> OrtStatusPtr
 }
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1618,7 +2085,7 @@ pub struct OrtCustomOp {
 	pub GetAliasMap: Option<unsafe extern "system" fn(input_index: *mut *mut core::ffi::c_int, output_index: *mut *mut core::ffi::c_int) -> usize>,
 	pub ReleaseAliasMap: Option<unsafe extern "system" fn(input_index: *mut core::ffi::c_int, output_index: *mut *mut core::ffi::c_int)>
 }
-extern "system" {
+unsafe extern "system" {
 	pub fn OrtSessionOptionsAppendExecutionProvider_CUDA(options: *mut OrtSessionOptions, device_id: core::ffi::c_int) -> OrtStatusPtr;
 	pub fn OrtSessionOptionsAppendExecutionProvider_ROCM(options: *mut OrtSessionOptions, device_id: core::ffi::c_int) -> OrtStatusPtr;
 	pub fn OrtSessionOptionsAppendExecutionProvider_MIGraphX(options: *mut OrtSessionOptions, device_id: core::ffi::c_int) -> OrtStatusPtr;

@@ -4,7 +4,7 @@ use image::{ImageBuffer, Luma, Pixel, imageops::FilterType};
 use ort::{
 	inputs,
 	session::{Session, builder::GraphOptimizationLevel},
-	tensor::ArrayExtensions,
+	util::ArrayExt,
 	value::TensorRef
 };
 
@@ -12,7 +12,7 @@ use ort::{
 fn mnist_5() -> ort::Result<()> {
 	const IMAGE_TO_LOAD: &str = "mnist_5.jpg";
 
-	ort::init().with_name("integration_test").commit()?;
+	ort::init().with_name("integration_test").commit();
 
 	let mut session = Session::builder()?
 		.with_optimization_level(GraphOptimizationLevel::Level1)?
@@ -22,11 +22,11 @@ fn mnist_5() -> ort::Result<()> {
 
 	let input0_shape = {
 		let metadata = session.metadata()?;
-		assert_eq!(metadata.name()?, "CNTKGraph");
-		assert_eq!(metadata.producer()?, "CNTK");
+		assert_eq!(metadata.name().as_deref(), Some("CNTKGraph"));
+		assert_eq!(metadata.producer().as_deref(), Some("CNTK"));
 
-		let input0_shape = session.inputs[0].input_type.tensor_shape().expect("input0 to be a tensor type");
-		let output0_shape = session.outputs[0].output_type.tensor_shape().expect("output0 to be a tensor type");
+		let input0_shape = session.inputs()[0].dtype().tensor_shape().expect("input0 to be a tensor type");
+		let output0_shape = session.outputs()[0].dtype().tensor_shape().expect("output0 to be a tensor type");
 
 		assert_eq!(&**input0_shape, &[1, 1, 28, 28]);
 		assert_eq!(&**output0_shape, &[1, 10]);

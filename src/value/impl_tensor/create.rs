@@ -11,14 +11,13 @@ use core::{
 #[cfg(feature = "ndarray")]
 use ndarray::{ArcArray, Array, ArrayView, ArrayViewMut, CowArray, Dimension};
 
-use super::{DynTensor, Tensor, TensorRef, TensorRefMut};
+use super::{DynTensor, PrimitiveTensorElementType, Shape, SymbolicDimensions, Tensor, TensorElementType, TensorRef, TensorRefMut, Utf8Data};
 use crate::{
 	AsPointer,
 	error::{Error, ErrorCode, Result},
 	memory::{Allocator, MemoryInfo},
 	ortsys,
-	tensor::{PrimitiveTensorElementType, Shape, SymbolicDimensions, TensorElementType, Utf8Data},
-	value::{Value, ValueInner, ValueType}
+	value::{IntoShape, Value, ValueInner, ValueType}
 };
 
 impl Tensor<String> {
@@ -72,17 +71,16 @@ impl Tensor<String> {
 		ortsys![unsafe FillStringTensor(value_ptr.as_ptr(), string_pointers.as_ptr(), string_pointers.len())?];
 
 		Ok(Value {
-			inner: Arc::new(ValueInner {
-				ptr: value_ptr,
-				dtype: ValueType::Tensor {
+			inner: ValueInner::new(
+				value_ptr,
+				ValueType::Tensor {
 					ty: TensorElementType::String,
 					shape,
 					dimension_symbols: SymbolicDimensions::empty(shape_len)
 				},
-				memory_info: unsafe { MemoryInfo::from_value(value_ptr) },
-				drop: true,
-				_backing: None
-			}),
+				unsafe { MemoryInfo::from_value(value_ptr) },
+				true
+			),
 			_markers: PhantomData
 		})
 	}
@@ -107,7 +105,7 @@ impl<T: PrimitiveTensorElementType + Debug> Tensor<T> {
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn new(allocator: &Allocator, shape: impl Into<Shape>) -> Result<Tensor<T>> {
+	pub fn new(allocator: &Allocator, shape: impl IntoShape) -> Result<Tensor<T>> {
 		let tensor = DynTensor::new(allocator, T::into_tensor_element_type(), shape)?;
 		Ok(unsafe { tensor.transmute_type() })
 	}
@@ -168,18 +166,17 @@ fn tensor_from_array(
 		nonNull(value_ptr)
 	];
 
+	let dtype = ValueType::Tensor {
+		ty: element_type,
+		dimension_symbols: SymbolicDimensions::empty(shape.len()),
+		shape
+	};
+
 	Ok(DynTensor {
-		inner: Arc::new(ValueInner {
-			ptr: value_ptr,
-			dtype: ValueType::Tensor {
-				ty: element_type,
-				dimension_symbols: SymbolicDimensions::empty(shape.len()),
-				shape
-			},
-			drop: true,
-			memory_info: Some(memory_info),
-			_backing: guard
-		}),
+		inner: match guard {
+			Some(backing) => ValueInner::new_backed(value_ptr, dtype, Some(memory_info), true, backing),
+			None => ValueInner::new(value_ptr, dtype, Some(memory_info), true)
+		},
 		_markers: PhantomData
 	})
 }
@@ -213,7 +210,7 @@ impl<'a, T: PrimitiveTensorElementType + Debug> TensorRef<'a, T> {
 	/// ```
 	///
 	/// When passing an [`ndarray`] type, the data **must** have a contiguous memory layout, or else an error will be
-	/// returned. See [`ndarray::ArrayBase::as_standard_layout`] to convert an array to a contiguous layout.
+	/// returned. See [`ndarray::ArrayRef::as_standard_layout`] to convert an array to a contiguous layout.
 	pub fn from_array_view(input: impl TensorArrayData<T> + 'a) -> Result<TensorRef<'a, T>> {
 		let (shape, data, guard) = input.ref_parts()?;
 		tensor_from_array(MemoryInfo::default(), shape, data.as_ptr() as *mut _, size_of::<T>(), T::into_tensor_element_type(), guard).map(|tensor| {
@@ -252,7 +249,7 @@ impl<'a, T: PrimitiveTensorElementType + Debug> TensorRefMut<'a, T> {
 	/// ```
 	///
 	/// When passing an [`ndarray`] type, the data **must** have a contiguous memory layout, or else an error will be
-	/// returned. See [`ndarray::ArrayBase::as_standard_layout`] to convert an array to a contiguous layout.
+	/// returned. See [`ndarray::ArrayRef::as_standard_layout`] to convert an array to a contiguous layout.
 	pub fn from_array_view_mut(mut input: impl TensorArrayDataMut<T>) -> Result<TensorRefMut<'a, T>> {
 		let (shape, data, guard) = input.ref_parts_mut()?;
 		tensor_from_array(MemoryInfo::default(), shape, data.as_ptr() as *mut _, size_of::<T>(), T::into_tensor_element_type(), guard).map(|tensor| {
@@ -320,6 +317,11 @@ pub struct TensorArrayDataParts<I> {
 	pub guard: Option<Box<dyn Any>>
 }
 
+#[diagnostic::on_unimplemented(
+	message = "`{Self}` is not a valid tensor shape definition",
+	note = "slices or `Vec`s of `usize`, `i32`, or `i64` are supported",
+	note = "you may have to explicitly define the type of integer literals (like 42_i64 instead of 42)"
+)]
 pub trait ToShape {
 	fn to_shape(&self, expected_size: Option<usize>) -> Result<Shape>;
 }
@@ -331,12 +333,13 @@ macro_rules! impl_to_shape {
 				.iter()
 				.enumerate()
 				.map(|(i, c)| {
-					if *c >= 1 {
+					#[allow(unused_comparisons)]
+					if *c >= 0 {
 						Ok(*c as i64)
 					} else {
 						Err(Error::new_with_code(
 							ErrorCode::InvalidArgument,
-							format!("Invalid dimension #{}; all dimensions must be >= 1 when creating a tensor from raw data", i + 1)
+							format!("Invalid dimension #{}; all dimensions must be >= 0 when creating a tensor from raw data", i + 1)
 						))
 					}
 				})
@@ -346,7 +349,7 @@ macro_rules! impl_to_shape {
 					Err(Error::new_with_code(
 						ErrorCode::InvalidArgument,
 						format!(
-							"Cannot create a tensor from raw data; shape {:?} ({} elements) is larger than the length of the data provided ({} elements)",
+							"Cannot create a tensor from raw data; shape {:?} ({} elements) is different from the length of the data provided ({} elements)",
 							v,
 							v.num_elements(),
 							expected_size

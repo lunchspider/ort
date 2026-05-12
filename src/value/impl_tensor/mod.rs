@@ -1,7 +1,9 @@
 #[cfg(not(target_arch = "wasm32"))] // `ort-web` does not support synchronous `Run`, which `.clone()` depends on.
 mod copy;
 mod create;
+mod element;
 mod extract;
+mod shape;
 
 use alloc::sync::Arc;
 use core::{
@@ -11,14 +13,17 @@ use core::{
 	ptr::{self}
 };
 
-pub use self::create::{OwnedTensorArrayData, TensorArrayData, TensorArrayDataMut, TensorArrayDataParts, ToShape};
+pub use self::{
+	create::{OwnedTensorArrayData, TensorArrayData, TensorArrayDataMut, TensorArrayDataParts, ToShape},
+	element::{IntoTensorElementType, PrimitiveTensorElementType, TensorElementType, Utf8Data},
+	shape::{IntoShape, Shape, SymbolicDimensions}
+};
 use super::{DowncastableTarget, DynValue, Value, ValueInner, ValueRef, ValueRefMut, ValueType, ValueTypeMarker};
 use crate::{
 	AsPointer,
 	error::Result,
 	memory::{Allocator, MemoryInfo},
-	ortsys,
-	tensor::{IntoTensorElementType, Shape, SymbolicDimensions, TensorElementType}
+	ortsys
 };
 
 pub trait TensorValueTypeMarker: ValueTypeMarker {
@@ -86,7 +91,7 @@ impl DynTensor {
 	/// This can be used to create a tensor with data on a certain device. For example, to create a tensor with pinned
 	/// (CPU) memory for use with CUDA:
 	/// ```no_run
-	/// # use ort::{memory::{Allocator, MemoryInfo, MemoryType, AllocationDevice, AllocatorType}, session::Session, tensor::TensorElementType, value::DynTensor};
+	/// # use ort::{memory::{Allocator, MemoryInfo, MemoryType, AllocationDevice, AllocatorType}, session::Session, value::{DynTensor, TensorElementType}};
 	/// # fn main() -> ort::Result<()> {
 	/// # let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// let allocator = Allocator::new(
@@ -98,7 +103,7 @@ impl DynTensor {
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn new(allocator: &Allocator, data_type: TensorElementType, shape: impl Into<Shape>) -> Result<DynTensor> {
+	pub fn new(allocator: &Allocator, data_type: TensorElementType, shape: impl IntoShape) -> Result<DynTensor> {
 		Self::new_inner(allocator, data_type, shape.into())
 	}
 
@@ -132,23 +137,22 @@ impl DynTensor {
 		}
 
 		Ok(Value {
-			inner: Arc::new(ValueInner {
-				ptr: value_ptr,
-				dtype: ValueType::Tensor {
+			inner: ValueInner::new(
+				value_ptr,
+				ValueType::Tensor {
 					ty: data_type,
 					shape,
 					dimension_symbols: SymbolicDimensions::empty(shape_len)
 				},
-				drop: true,
-				memory_info: Some(memory_info),
-				_backing: None
-			}),
+				Some(memory_info),
+				true
+			),
 			_markers: PhantomData
 		})
 	}
 }
 
-impl<Type: DefiniteTensorValueTypeMarker + ?Sized> Value<Type> {
+impl<Type: TensorValueTypeMarker + ?Sized> Value<Type> {
 	/// Returns a mutable pointer to the tensor's data. The pointer may be null in the case of zero-sized tensors.
 	///
 	/// It's important to note that the resulting pointer may not point to CPU-accessible memory. In the case of a
@@ -260,7 +264,7 @@ impl<T: IntoTensorElementType + Debug> Tensor<T> {
 	/// # }
 	/// ```
 	#[inline]
-	pub fn upcast_ref(&self) -> DynTensorRef {
+	pub fn upcast_ref(&self) -> DynTensorRef<'_> {
 		DynTensorRef::new(Value {
 			inner: Arc::clone(&self.inner),
 			_markers: PhantomData
@@ -284,7 +288,7 @@ impl<T: IntoTensorElementType + Debug> Tensor<T> {
 	/// # }
 	/// ```
 	#[inline]
-	pub fn upcast_mut(&mut self) -> DynTensorRefMut {
+	pub fn upcast_mut(&mut self) -> DynTensorRefMut<'_> {
 		DynTensorRefMut::new(Value {
 			inner: Arc::clone(&self.inner),
 			_markers: PhantomData
@@ -323,8 +327,8 @@ impl<T: IntoTensorElementType + Clone + Debug, const N: usize> Index<[i64; N]> f
 		}
 
 		let mut out: *mut ort_sys::c_void = ptr::null_mut();
-		ortsys![unsafe TensorAt(self.ptr().cast_mut(), index.as_ptr(), N, &mut out).expect("Failed to index tensor")];
-		unsafe { &*out.cast::<T>() }
+		ortsys![unsafe TensorAt(self.ptr().cast_mut(), index.as_ptr(), N, &mut out).expect("Failed to index tensor"); nonNull(out)];
+		unsafe { out.cast::<T>().as_ref() }
 	}
 }
 impl<T: IntoTensorElementType + Clone + Debug, const N: usize> IndexMut<[i64; N]> for Tensor<T> {
@@ -334,8 +338,8 @@ impl<T: IntoTensorElementType + Clone + Debug, const N: usize> IndexMut<[i64; N]
 		}
 
 		let mut out: *mut ort_sys::c_void = ptr::null_mut();
-		ortsys![unsafe TensorAt(self.ptr_mut(), index.as_ptr(), N, &mut out).expect("Failed to index tensor")];
-		unsafe { &mut *out.cast::<T>() }
+		ortsys![unsafe TensorAt(self.ptr_mut(), index.as_ptr(), N, &mut out).expect("Failed to index tensor"); nonNull(out)];
+		unsafe { out.cast::<T>().as_mut() }
 	}
 }
 
@@ -346,15 +350,13 @@ mod tests {
 	#[cfg(feature = "ndarray")]
 	use ndarray::{ArcArray1, Array1, CowArray};
 
-	use super::Tensor;
+	use super::{Shape, SymbolicDimensions, Tensor, TensorElementType};
 	use crate::{
-		memory::Allocator,
-		tensor::{Shape, SymbolicDimensions, TensorElementType},
-		value::{TensorRef, ValueType}
+		memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
+		value::{TensorRef, TensorRefMut, ValueType}
 	};
 
 	#[test]
-	#[cfg(feature = "ndarray")]
 	fn test_tensor_value() -> crate::Result<()> {
 		let v: Vec<f32> = vec![1., 2., 3., 4., 5.];
 		let value = Tensor::from_array(Array1::from_vec(v.clone()))?;
@@ -371,6 +373,50 @@ mod tests {
 		let (shape, data) = value.extract_tensor();
 		assert_eq!(&**shape, [v.len() as i64]);
 		assert_eq!(data, &v);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_tensor_from_bad_shapes() -> crate::Result<()> {
+		let v: Vec<f32> = vec![1., 2., 3., 4., 5.];
+
+		assert!(Tensor::from_array((Vec::<i64>::new(), vec![0.0])).is_ok());
+
+		assert!(TensorRef::from_array_view((vec![4i64], &*v)).is_err());
+		assert!(TensorRef::from_array_view((vec![67i64], &*v)).is_err());
+		assert!(TensorRef::from_array_view((vec![1i64, 5, -1], &*v)).is_err());
+		assert!(TensorRef::from_array_view(((), [0.0f32, 1.0].as_slice())).is_err());
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_tensor_from_raw() -> crate::Result<()> {
+		let mut v: Vec<f32> = vec![1., 2., 3., 4., 5.];
+
+		let value = unsafe {
+			TensorRefMut::<f32>::from_raw(
+				MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?,
+				v.as_mut_ptr().cast(),
+				Shape::new(vec![5i64])
+			)?
+		};
+		assert_eq!(value.dtype().tensor_type(), Some(TensorElementType::Float32));
+		assert_eq!(
+			value.dtype(),
+			&ValueType::Tensor {
+				ty: TensorElementType::Float32,
+				shape: Shape::new([v.len() as i64]),
+				dimension_symbols: SymbolicDimensions::empty(1)
+			}
+		);
+
+		let (shape, data) = value.extract_tensor();
+		assert_eq!(&**shape, [v.len() as i64]);
+		assert_eq!(data, &v);
+
+		assert!(value.try_upgrade().is_err());
 
 		Ok(())
 	}

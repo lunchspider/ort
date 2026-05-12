@@ -3,6 +3,7 @@
 #![allow(clippy::tabs_in_doc_comments, clippy::arc_with_non_send_sync)]
 #![allow(clippy::macro_metavars_in_unsafe)]
 #![warn(clippy::unwrap_used)]
+#![deny(clippy::std_instead_of_alloc, clippy::std_instead_of_core)]
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 //! <div align=center>
@@ -11,7 +12,7 @@
 //! </div>
 //!
 //! `ort` is a Rust binding for [ONNX Runtime](https://onnxruntime.ai/). For information on how to get started with `ort`,
-//! see <https://ort.pyke.io/introduction>.
+//! see <https://ort.pyke.io/>.
 
 extern crate alloc;
 extern crate core;
@@ -24,44 +25,53 @@ pub mod __private {
 #[macro_use]
 pub(crate) mod private;
 
-pub mod adapter;
+#[cfg(feature = "api-22")]
+#[cfg_attr(docsrs, doc(cfg(feature = "api-22")))]
 pub mod compiler;
+#[cfg(feature = "api-22")]
+#[cfg_attr(docsrs, doc(cfg(feature = "api-22")))]
+pub mod device;
+#[cfg(feature = "api-22")]
+#[cfg_attr(docsrs, doc(cfg(feature = "api-22")))]
 pub mod editor;
 pub mod environment;
+pub mod ep;
 pub mod error;
-pub mod execution_providers;
-pub mod io_binding;
 pub mod logging;
 pub mod memory;
-pub mod metadata;
 pub mod operator;
 pub mod session;
-pub mod tensor;
 #[cfg(feature = "training")]
 #[cfg_attr(docsrs, doc(cfg(feature = "training")))]
 pub mod training;
 pub mod util;
 pub mod value;
+#[doc(hidden)]
 pub mod api {
+	pub use super::api as ort;
 	#[cfg(feature = "training")]
 	pub use super::training::training_api as training;
-	pub use super::{api as ort, compiler::compile_api as compile, editor::editor_api as editor};
+	#[cfg(feature = "api-22")]
+	pub use super::{compiler::compile_api as compile, editor::editor_api as editor};
 }
 
-#[cfg(feature = "load-dynamic")]
-use alloc::sync::Arc;
-use alloc::{borrow::ToOwned, boxed::Box, string::String};
-use core::{
-	ffi::{CStr, c_char},
-	ptr::NonNull,
-	str
-};
+#[deprecated = "import execution providers from `ort::ep` instead"]
+#[doc(hidden)]
+pub mod execution_providers {
+	#[deprecated = "import execution providers from `ort::ep` instead"]
+	pub use super::ep::*;
+}
+
+use alloc::boxed::Box;
+use core::{ffi::CStr, ptr::NonNull, str};
 
 pub use ort_sys as sys;
 
-#[cfg(feature = "load-dynamic")]
+#[cfg(all(feature = "load-dynamic", not(target_arch = "wasm32")))]
 pub use self::environment::init_from;
 pub(crate) use self::logging::{debug, error, info, trace, warning as warn};
+#[cfg(test)]
+pub(crate) mod test_util;
 use self::util::OnceLock;
 pub use self::{
 	environment::init,
@@ -69,49 +79,98 @@ pub use self::{
 };
 
 /// The minor version of ONNX Runtime used by this version of `ort`.
+///
+/// This is equal to the version of the ONNX Runtime API used by `ort` (available in [`ort-sys`][ort_sys] as
+/// [`ORT_API_VERSION`](ort_sys::ORT_API_VERSION)). `ort` requires that the backend supports *at least* this version of
+/// the API.
 pub const MINOR_VERSION: u32 = ort_sys::ORT_API_VERSION;
 
-#[cfg(feature = "load-dynamic")]
-pub(crate) static G_ORT_DYLIB_PATH: OnceLock<Arc<String>> = OnceLock::new();
-#[cfg(feature = "load-dynamic")]
-pub(crate) static G_ORT_LIB: OnceLock<Arc<libloading::Library>> = OnceLock::new();
+#[cfg(all(feature = "load-dynamic", not(target_arch = "wasm32")))]
+pub(crate) mod load_dynamic {
+	use core::{ffi::CStr, fmt};
+	use std::path::PathBuf;
 
-#[cfg(feature = "load-dynamic")]
-pub(crate) fn dylib_path() -> &'static String {
-	G_ORT_DYLIB_PATH.get_or_init(|| {
-		let path = match std::env::var("ORT_DYLIB_PATH") {
-			Ok(s) if !s.is_empty() => s,
-			#[cfg(target_os = "windows")]
-			_ => "onnxruntime.dll".to_owned(),
-			#[cfg(any(target_os = "linux", target_os = "android"))]
-			_ => "libonnxruntime.so".to_owned(),
-			#[cfg(any(target_os = "macos", target_os = "ios"))]
-			_ => "libonnxruntime.dylib".to_owned()
-		};
-		Arc::new(path)
-	})
-}
+	use crate::{MINOR_VERSION, util::OnceLock};
 
-#[cfg(feature = "load-dynamic")]
-pub(crate) fn lib_handle() -> &'static libloading::Library {
-	G_ORT_LIB.get_or_init(|| {
-		// resolve path relative to executable
-		let path: std::path::PathBuf = dylib_path().into();
-		let absolute_path = if path.is_absolute() {
-			path
-		} else {
-			let relative = std::env::current_exe()
-				.expect("could not get current executable path")
-				.parent()
-				.expect("executable is root?")
-				.join(&path);
-			if relative.exists() { relative } else { path }
-		};
-		let lib = unsafe { libloading::Library::new(&absolute_path) }
-			.unwrap_or_else(|e| panic!("An error occurred while attempting to load the ONNX Runtime binary at `{}`: {e}", absolute_path.display()));
-		Arc::new(lib)
-	})
+	#[derive(Debug)]
+	pub enum LoadError {
+		Dlopen { error: libloading::Error, path: PathBuf },
+		MissingApi { path: PathBuf },
+		BadVersion { version_str: String, path: PathBuf }
+	}
+
+	impl fmt::Display for LoadError {
+		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+			match self {
+				Self::Dlopen { error, path } => f.write_fmt(format_args!("failed to load from `{}`: {error}", path.display())),
+				Self::MissingApi { path } => f.write_fmt(format_args!("{} does not export `OrtGetApiBase`", path.display())),
+				Self::BadVersion { version_str, path } => f.write_fmt(format_args!(
+					"ort {} is not compatible with the ONNX Runtime binary found at `{}`; expected version >= '1.{}.x', but got '{version_str}'",
+					env!("CARGO_PKG_VERSION"),
+					path.display(),
+					super::MINOR_VERSION
+				))
+			}
+		}
+	}
+
+	impl core::error::Error for LoadError {}
+
+	pub(crate) static G_ORT_LIB: OnceLock<libloading::Library> = OnceLock::new();
+
+	pub(crate) fn init(path: &std::path::Path) -> Result<bool, LoadError> {
+		let mut inserter = Some(|| -> Result<libloading::Library, LoadError> {
+			use core::cmp::Ordering;
+
+			let absolute_path = if path.is_absolute() {
+				path.to_path_buf()
+			} else {
+				let relative = std::env::current_exe()
+					.expect("could not get current executable path")
+					.parent()
+					.expect("executable is root?")
+					.join(path);
+				if relative.exists() { relative } else { path.to_path_buf() }
+			};
+			let lib = unsafe { libloading::Library::new(&absolute_path) }.map_err(|e| LoadError::Dlopen {
+				error: e,
+				path: absolute_path.clone()
+			})?;
+
+			let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const ort_sys::OrtApiBase> =
+				unsafe { lib.get(b"OrtGetApiBase") }.map_err(|_| LoadError::MissingApi { path: absolute_path.clone() })?;
+			let base: *const ort_sys::OrtApiBase = unsafe { base_getter() };
+			assert!(!base.is_null());
+
+			let version_string = unsafe { ((*base).GetVersionString)() };
+			let version_string = unsafe { CStr::from_ptr(version_string) }.to_string_lossy();
+
+			let lib_minor_version = version_string.split('.').nth(1).map_or(0, |x| x.parse::<u32>().unwrap_or(0));
+			match lib_minor_version.cmp(&MINOR_VERSION) {
+				Ordering::Less => {
+					return Err(LoadError::BadVersion {
+						version_str: version_string.to_string(),
+						path: absolute_path
+					});
+				}
+				Ordering::Greater => crate::info!(
+					"ort {} was designed for ONNX Runtime '1.{MINOR_VERSION}.x' and may have compatibility issues with the ONNX Runtime binary found at `{}`, which is version '{version_string}'",
+					env!("CARGO_PKG_VERSION"),
+					absolute_path.display()
+				),
+				Ordering::Equal => {}
+			};
+
+			crate::info!("Loaded ONNX Runtime dylib from \"{}\"; version '{version_string}'", absolute_path.display());
+
+			Ok(lib)
+		});
+		G_ORT_LIB.get_or_try_init(|| (unsafe { inserter.take().unwrap_unchecked() })())?;
+		Ok(inserter.is_none())
+	}
 }
+#[cfg(all(feature = "load-dynamic", not(target_arch = "wasm32")))]
+pub use self::load_dynamic::LoadError as LoadDynamicError;
 
 /// Returns information about the build of ONNX Runtime used, including version, Git commit, and compile flags.
 ///
@@ -137,68 +196,68 @@ static G_ORT_API: OnceLock<ApiPointer> = OnceLock::new();
 /// - The `alternative-backend` feature is enabled and [`set_api`] was not yet called.
 /// - Getting the `OrtApi` struct fails, due to `ort` loading an unsupported version of ONNX Runtime.
 /// - Loading the ONNX Runtime dynamic library fails if the `load-dynamic` feature is enabled.
+#[inline]
 pub fn api() -> &'static ort_sys::OrtApi {
-	#[cfg(feature = "alternative-backend")]
+	#[cfg(any(feature = "alternative-backend", target_arch = "wasm32"))]
 	let ptr = G_ORT_API
 		.get()
 		.expect(
-			"attempted to use `ort` APIs before initializing a backend\nwhen the `alternative-backend` feature is enabled, `ort::set_api` must be called to configure the `OrtApi` used by the library"
+			"attempted to use `ort` APIs before initializing a backend\nwhen the `alternative-backend` feature is enabled, `ort::set_api` must be called first to configure the `OrtApi` used by the library"
 		)
 		.0;
-	#[cfg(not(feature = "alternative-backend"))]
-	let ptr = G_ORT_API
-		.get_or_init(|| {
-			#[cfg(feature = "load-dynamic")]
-			unsafe {
-				use core::cmp::Ordering;
-
-				let dylib = lib_handle();
-				let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const ort_sys::OrtApiBase> = dylib
-					.get(b"OrtGetApiBase")
-					.expect("`OrtGetApiBase` must be present in ONNX Runtime dylib");
-				let base: *const ort_sys::OrtApiBase = base_getter();
-				assert!(!base.is_null());
-
-				let version_string = ((*base).GetVersionString)();
-				let version_string = CStr::from_ptr(version_string).to_string_lossy();
-				crate::info!("Loaded ONNX Runtime dylib with version '{version_string}'");
-
-				let lib_minor_version = version_string.split('.').nth(1).map_or(0, |x| x.parse::<u32>().unwrap_or(0));
-				match lib_minor_version.cmp(&MINOR_VERSION) {
-					Ordering::Less => panic!(
-						"ort {} is not compatible with the ONNX Runtime binary found at `{}`; expected GetVersionString to return '1.{MINOR_VERSION}.x', but got '{version_string}'",
-						env!("CARGO_PKG_VERSION"),
-						dylib_path()
-					),
-					Ordering::Greater => crate::warn!(
-						"ort {} may have compatibility issues with the ONNX Runtime binary found at `{}`; expected GetVersionString to return '1.{MINOR_VERSION}.x', but got '{version_string}'",
-						env!("CARGO_PKG_VERSION"),
-						dylib_path()
-					),
-					Ordering::Equal => {}
-				};
-				let api: *const ort_sys::OrtApi = ((*base).GetApi)(ort_sys::ORT_API_VERSION);
-				ApiPointer(NonNull::new(api.cast_mut()).expect("Failed to initialize ORT API"))
-			}
-			#[cfg(not(feature = "load-dynamic"))]
-			unsafe {
-				let base: *const ort_sys::OrtApiBase = ort_sys::OrtGetApiBase();
-				assert!(!base.is_null());
-				let api: *const ort_sys::OrtApi = ((*base).GetApi)(ort_sys::ORT_API_VERSION);
-				ApiPointer(NonNull::new(api.cast_mut()).expect("Failed to initialize ORT API"))
-			}
-		})
-		.0;
+	#[cfg(not(any(feature = "alternative-backend", target_arch = "wasm32")))]
+	let ptr = G_ORT_API.get_or_init(setup_api).0;
 	unsafe { ptr.as_ref() }
+}
+
+#[cfg(not(any(feature = "alternative-backend", target_arch = "wasm32")))]
+#[cold]
+fn setup_api() -> ApiPointer {
+	#[cfg(feature = "load-dynamic")]
+	let base = unsafe {
+		use crate::load_dynamic::G_ORT_LIB;
+
+		let dylib = if let Some(handle) = G_ORT_LIB.get() {
+			handle
+		} else {
+			let path: std::path::PathBuf = match std::env::var("ORT_DYLIB_PATH") {
+				Ok(s) if !s.is_empty() => s,
+				#[cfg(target_os = "windows")]
+				_ => "onnxruntime.dll".to_owned(),
+				#[cfg(any(target_os = "linux", target_os = "android"))]
+				_ => "libonnxruntime.so".to_owned(),
+				#[cfg(any(target_os = "macos", target_os = "ios"))]
+				_ => "libonnxruntime.dylib".to_owned()
+			}
+			.into();
+			load_dynamic::init(&path).expect("Failed to load ONNX Runtime dylib");
+			G_ORT_LIB.get_unchecked()
+		};
+		let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const ort_sys::OrtApiBase> = dylib
+			.get(b"OrtGetApiBase")
+			.expect("`OrtGetApiBase` must be present in ONNX Runtime dylib");
+		base_getter()
+	};
+	#[cfg(not(feature = "load-dynamic"))]
+	let base = unsafe { ort_sys::OrtGetApiBase() };
+
+	assert!(!base.is_null());
+	let api: *const ort_sys::OrtApi = unsafe { ((*base).GetApi)(ort_sys::ORT_API_VERSION) };
+	ApiPointer(NonNull::new(api.cast_mut()).expect("Failed to initialize ORT API"))
 }
 
 /// Sets the global [`ort_sys::OrtApi`] interface used by `ort` in order to use alternative backends, or a custom
 /// loading scheme.
 ///
-/// When using `alternative-backend`, this must be called before using any other `ort` API.
+/// When using an alternative backend, this must be called before using any other `ort` API.
 ///
-/// Returns `true` if successful (i.e. no API has been set up to this point). This function will not override the API if
-/// one was already set.
+/// Returns `true` if successful, meaning this API will take effect. If an API was already set prior, it will not be
+/// overridden, and this function will return `false`.
+///
+/// ```no_run
+/// # use ort_sys::stub as ort_tract;
+/// ort::set_api(ort_tract::api());
+/// ```
 pub fn set_api(api: ort_sys::OrtApi) -> bool {
 	G_ORT_API.try_insert_with(|| ApiPointer(unsafe { NonNull::new_unchecked(Box::leak(Box::new(api))) }))
 }
@@ -267,41 +326,19 @@ macro_rules! ortsys {
 		unsafe { ($crate::api().$method)($($n),*) }
 	};
 	(@ort: unsafe $method:ident($($n:expr),*) as Result) => {
-		unsafe { $crate::error::status_to_result(($crate::api().$method)($($n),+)) }
+		unsafe { $crate::error::Error::result_from_status(($crate::api().$method)($($n),+)) }
 	};
 	(@$api:ident: unsafe $method:ident($($n:expr),*)) => {
 		unsafe { ($crate::api::$api().unwrap().$method)($($n),+) }
 	};
 	(@$api:ident: unsafe $method:ident($($n:expr),*)?) => {
-		$crate::api::$api().and_then(|api| unsafe { $crate::error::status_to_result((api.$method)($($n),+)) })?
+		$crate::api::$api().and_then(|api| unsafe { $crate::error::Error::result_from_status((api.$method)($($n),+)) })?
 	};
 	(@$api:ident: unsafe $method:ident($($n:expr),*)?; nonNull($($check:ident),+)$(;)?) => {
-		$crate::api::$api().and_then(|api| unsafe { $crate::error::status_to_result((api.$method)($($n),+)) })?;
+		$crate::api::$api().and_then(|api| unsafe { $crate::error::Error::result_from_status((api.$method)($($n),+)) })?;
 		ortsys![@nonNull?; $($check),+];
 	};
 	(@$api:ident: unsafe $method:ident($($n:expr),*) as Result) => {
-		$crate::api::$api().and_then(|api| unsafe { $crate::error::status_to_result((api.$method)($($n),+)) })
+		$crate::api::$api().and_then(|api| unsafe { $crate::error::Error::result_from_status((api.$method)($($n),+)) })
 	};
-}
-
-pub(crate) fn char_p_to_string(raw: *const c_char) -> Result<String> {
-	if raw.is_null() {
-		return Ok(String::new());
-	}
-	let c_string = unsafe { CStr::from_ptr(raw.cast_mut()).to_owned() };
-	Ok(c_string.to_string_lossy().into())
-}
-
-#[cfg(test)]
-mod test {
-	use alloc::ffi::CString;
-
-	use super::*;
-
-	#[test]
-	fn test_char_p_to_string() {
-		let s = CString::new("foo").unwrap_or_else(|_| unreachable!());
-		let ptr = s.as_c_str().as_ptr();
-		assert_eq!("foo", char_p_to_string(ptr).expect("failed to convert string"));
-	}
 }

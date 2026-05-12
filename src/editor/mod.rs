@@ -9,22 +9,27 @@ use smallvec::SmallVec;
 
 use crate::{
 	AsPointer, Error, OnceLock, Result,
-	environment::get_environment,
-	operator::attribute::Attribute,
+	operator::Attribute,
 	ortsys,
 	session::{Session, builder::SessionBuilder},
-	util::{run_on_drop, with_cstr, with_cstr_ptr_array},
-	value::{TensorValueTypeMarker, Value, ValueType}
+	util::{with_cstr, with_cstr_ptr_array},
+	value::{Outlet, TensorValueTypeMarker, Value}
 };
 
 #[cfg(test)]
 mod tests;
 
+/// The domain used for builtin ONNX operators under the canonical `ai.onnx` domain.
+///
+/// Note that, currently, this is an empty string, because that is what ONNX Runtime uses internally to denote `ai.onnx`
+/// operators. This behavior may change in the future, so when [creating nodes](Node::new) or [adding
+/// opsets](Opset::new), this constant should be used instead of `ai.onnx`.
 pub const ONNX_DOMAIN: &str = "";
+/// The domain used for builtin ONNX ML operators under the canonical `ai.onnx.ml` domain.
 pub const ONNX_ML_DOMAIN: &str = "ai.onnx.ml";
 
 /// Returns a pointer to the global [`ort_sys::OrtModelEditorApi`] object, or errors if the Model Editor API is not
-/// supported.
+/// supported by this backend.
 pub fn editor_api() -> Result<&'static ort_sys::OrtModelEditorApi> {
 	struct ModelEditorApiPointer(*const ort_sys::OrtModelEditorApi);
 	unsafe impl Send for ModelEditorApiPointer {}
@@ -45,44 +50,42 @@ pub fn editor_api() -> Result<&'static ort_sys::OrtModelEditorApi> {
 	Ok(unsafe { ptr.as_ref() })
 }
 
+/// A single node in a [`Graph`] that performs a specific operation on its inputs.
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct Outlet(NonNull<ort_sys::OrtValueInfo>);
-
-impl Outlet {
-	pub fn new(name: impl AsRef<str>, dtype: &ValueType) -> Result<Self> {
-		let type_info = dtype.to_type_info()?;
-		let _guard = run_on_drop(|| ortsys![unsafe ReleaseTypeInfo(type_info)]);
-
-		let ptr = with_cstr(name.as_ref().as_bytes(), &|name| {
-			let mut ptr: *mut ort_sys::OrtValueInfo = ptr::null_mut();
-			ortsys![@editor: unsafe CreateValueInfo(name.as_ptr(), type_info, &mut ptr)?; nonNull(ptr)];
-			Ok(ptr)
-		})?;
-		Ok(Self(ptr))
-	}
-
-	pub(crate) fn consume(self) -> NonNull<ort_sys::OrtValueInfo> {
-		ManuallyDrop::new(self).0
-	}
-}
-
-impl AsPointer for Outlet {
-	type Sys = ort_sys::OrtValueInfo;
-	fn ptr(&self) -> *const Self::Sys {
-		self.0.as_ptr()
-	}
-}
-
-impl Drop for Outlet {
-	fn drop(&mut self) {
-		ortsys![unsafe ReleaseValueInfo(self.0.as_ptr())];
-	}
-}
-
 pub struct Node(NonNull<ort_sys::OrtNode>);
 
 impl Node {
+	/// Creates a new node in a [`Graph`].
+	///
+	/// - `operator_name` is the name of the operator, i.e. `Add`, `Conv`, `LayerNorm`.
+	/// - `domain_name` is the domain of the operator; usually [`ONNX_DOMAIN`] for builtin ONNX operators, but can also
+	///   refer to a [custom operator domain](crate::operator::OperatorDomain).
+	/// - `node_name` is a graph-unique name used to identify this node.
+	/// - `inputs` is an array of inputs to the operator. This could be a [graph input](Outlet), an
+	///   [initializer](Graph::add_initializer), or the name of another node's output.
+	/// - `outputs` is an array of names to assign to the operator's outputs.
+	/// - `attributes` is an array of attributes used to configure the operator, e.g. `strides` for `Conv` nodes.
+	///
+	/// ```
+	/// # use ort::{editor::{Node, ONNX_DOMAIN}, operator::Attribute};
+	/// # fn main() -> ort::Result<()> {
+	/// let node = Node::new(
+	/// 	"Conv",
+	/// 	ONNX_DOMAIN,
+	/// 	"layers.0.conv_in",
+	/// 	["image", "layers.0.conv_in.weight"],
+	/// 	["layers.0.conv_in.output"],
+	/// 	[
+	/// 		Attribute::new("strides", vec![3_i64])?,
+	/// 		Attribute::new("dilations", vec![1_i64])?,
+	/// 		Attribute::new("group", 1i64)?,
+	/// 		Attribute::new("kernel_shape", vec![1_i64])?
+	/// 	]
+	/// )?;
+	/// # Ok(())
+	/// # }
+	/// ```
 	pub fn new<I: AsRef<str>, O: AsRef<str>>(
 		operator_name: impl AsRef<str>,
 		domain_name: impl AsRef<str>,
@@ -114,6 +117,7 @@ impl Node {
 								)?;
 								nonNull(out)
 							];
+							crate::logging::create!(Node, out);
 							Ok(Self(out))
 						})
 					})
@@ -137,28 +141,34 @@ impl AsPointer for Node {
 impl Drop for Node {
 	fn drop(&mut self) {
 		ortsys![unsafe ReleaseNode(self.0.as_ptr())];
+		crate::logging::drop!(Node, self.0);
 	}
 }
 
+/// A single graph in a [`Model`], comprised of [`Node`]s (and optional initializers, aka weights), and describing its
+/// inputs/outputs.
+#[derive(Debug)]
+#[repr(transparent)]
 pub struct Graph(*mut ort_sys::OrtGraph);
 
 impl Graph {
 	pub fn new() -> Result<Self> {
 		let mut out = ptr::null_mut();
 		ortsys![@editor: unsafe CreateGraph(&mut out)?];
+		crate::logging::create!(Graph, out);
 		Ok(Self(out))
 	}
 
 	pub fn set_inputs(&mut self, inputs: impl IntoIterator<Item = Outlet>) -> Result<()> {
-		let inputs: SmallVec<NonNull<ort_sys::OrtValueInfo>, 4> = inputs.into_iter().map(|input| input.consume()).collect();
-		// no need to drop consumed pointers since this only errors on null pointers
+		let inputs: SmallVec<[NonNull<ort_sys::OrtValueInfo>; 4]> = inputs.into_iter().filter_map(|input| input.into_value_info_ptr()).collect();
+		// this takes ownership of the OrtValueInfos so no need to free those
 		ortsys![@editor: unsafe SetGraphInputs(self.0, inputs.as_ptr() as *mut _, inputs.len())?];
 		Ok(())
 	}
 
 	pub fn set_outputs(&mut self, outputs: impl IntoIterator<Item = Outlet>) -> Result<()> {
-		let outputs: SmallVec<NonNull<ort_sys::OrtValueInfo>, 4> = outputs.into_iter().map(|output| output.consume()).collect();
-		// no need to drop consumed pointers since this only errors on null pointers
+		let outputs: SmallVec<[NonNull<ort_sys::OrtValueInfo>; 4]> = outputs.into_iter().filter_map(|input| input.into_value_info_ptr()).collect();
+		// this takes ownership of the OrtValueInfos so no need to free those
 		ortsys![@editor: unsafe SetGraphOutputs(self.0, outputs.as_ptr() as *mut _, outputs.len())?];
 		Ok(())
 	}
@@ -173,7 +183,7 @@ impl Graph {
 		let Some(value_inner) = Arc::get_mut(&mut initializer.inner) else {
 			return Err(Error::new("Initializers must be unique"))?;
 		};
-		if value_inner._backing.is_some() {
+		if value_inner.is_backed() {
 			// `AddInitializerToGraph` wants to take ownership of the value, so the memory needs to be managed by ONNX Runtime.
 			// The documentation technically recommends using non-managed memory when `as_external = true`, but it doesn't seem like
 			// that matters.
@@ -209,6 +219,7 @@ impl AsPointer for Graph {
 impl Drop for Graph {
 	fn drop(&mut self) {
 		ortsys![unsafe ReleaseGraph(self.0)];
+		crate::logging::drop!(Graph, self.0);
 	}
 }
 
@@ -220,7 +231,12 @@ pub struct Opset {
 
 impl Opset {
 	pub fn new(domain_name: impl AsRef<str>, version: u32) -> Result<Self> {
-		let domain_name = CString::new(domain_name.as_ref())?;
+		let mut domain_name = domain_name.as_ref();
+		if domain_name == "ai.onnx" {
+			domain_name = ONNX_DOMAIN;
+		}
+
+		let domain_name = CString::new(domain_name)?;
 		Ok(Self { domain_name, version })
 	}
 }
@@ -232,11 +248,12 @@ pub struct Model(NonNull<ort_sys::OrtModel>);
 impl Model {
 	pub fn new(opsets: impl AsRef<[Opset]>) -> Result<Self> {
 		let opsets = opsets.as_ref();
-		let domain_names: SmallVec<*const c_char, 4> = opsets.iter().map(|p| p.domain_name.as_ptr()).collect();
-		let opset_versions: SmallVec<i32, 4> = opsets.iter().map(|p| p.version as i32).collect();
+		let domain_names: SmallVec<[*const c_char; 4]> = opsets.iter().map(|p| p.domain_name.as_ptr()).collect();
+		let opset_versions: SmallVec<[i32; 4]> = opsets.iter().map(|p| p.version as i32).collect();
 
 		let mut ptr = ptr::null_mut();
 		ortsys![@editor: unsafe CreateModel(domain_names.as_ptr(), opset_versions.as_ptr(), opsets.len(), &mut ptr)?; nonNull(ptr)];
+		crate::logging::create!(Model, ptr);
 		Ok(Self(ptr))
 	}
 
@@ -246,12 +263,11 @@ impl Model {
 		Ok(())
 	}
 
-	pub fn into_session(self, mut options: SessionBuilder) -> Result<Session> {
-		let env = get_environment()?;
+	pub fn into_session(self, options: &SessionBuilder) -> Result<Session> {
 		let mut session_ptr = ptr::null_mut();
 		ortsys![@editor:
 			unsafe CreateSessionFromModel(
-				env.ptr(),
+				options.environment.ptr(),
 				self.0.as_ptr(),
 				options.ptr(),
 				&mut session_ptr
@@ -272,5 +288,6 @@ impl AsPointer for Model {
 impl Drop for Model {
 	fn drop(&mut self) {
 		ortsys![unsafe ReleaseModel(self.0.as_ptr())];
+		crate::logging::drop!(Model, self.0);
 	}
 }

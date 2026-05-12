@@ -37,10 +37,11 @@ pub use self::{
 		DynSequence, DynSequenceRef, DynSequenceRefMut, DynSequenceValueType, Sequence, SequenceRef, SequenceRefMut, SequenceValueType, SequenceValueTypeMarker
 	},
 	impl_tensor::{
-		DefiniteTensorValueTypeMarker, DynTensor, DynTensorRef, DynTensorRefMut, DynTensorValueType, OwnedTensorArrayData, Tensor, TensorArrayData,
-		TensorArrayDataMut, TensorArrayDataParts, TensorRef, TensorRefMut, TensorValueType, TensorValueTypeMarker, ToShape
+		DefiniteTensorValueTypeMarker, DynTensor, DynTensorRef, DynTensorRefMut, DynTensorValueType, IntoShape, IntoTensorElementType, OwnedTensorArrayData,
+		PrimitiveTensorElementType, Shape, SymbolicDimensions, Tensor, TensorArrayData, TensorArrayDataMut, TensorArrayDataParts, TensorElementType, TensorRef,
+		TensorRefMut, TensorValueType, TensorValueTypeMarker, ToShape, Utf8Data
 	},
-	r#type::ValueType
+	r#type::{Outlet, ValueType}
 };
 use crate::{
 	AsPointer,
@@ -56,7 +57,35 @@ pub(crate) struct ValueInner {
 	pub(crate) dtype: ValueType,
 	pub(crate) memory_info: Option<MemoryInfo>,
 	pub(crate) drop: bool,
-	pub(crate) _backing: Option<Box<dyn Any>>
+	_backing: Option<Box<dyn Any>>
+}
+
+impl ValueInner {
+	pub fn new(ptr: NonNull<ort_sys::OrtValue>, dtype: ValueType, memory_info: Option<MemoryInfo>, drop: bool) -> Arc<Self> {
+		crate::logging::create!(Value, ptr);
+		Arc::new(Self {
+			ptr,
+			dtype,
+			memory_info,
+			drop,
+			_backing: None
+		})
+	}
+
+	pub fn new_backed(ptr: NonNull<ort_sys::OrtValue>, dtype: ValueType, memory_info: Option<MemoryInfo>, drop: bool, backing: Box<dyn Any>) -> Arc<Self> {
+		crate::logging::create!(Value, ptr);
+		Arc::new(Self {
+			ptr,
+			dtype,
+			memory_info,
+			drop,
+			_backing: Some(backing)
+		})
+	}
+
+	pub(crate) fn is_backed(&self) -> bool {
+		self._backing.is_some()
+	}
 }
 
 impl AsPointer for ValueInner {
@@ -70,9 +99,8 @@ impl AsPointer for ValueInner {
 impl Drop for ValueInner {
 	fn drop(&mut self) {
 		if self.drop {
-			let ptr = self.ptr_mut();
-			crate::trace!("dropping value at {ptr:p}");
-			ortsys![unsafe ReleaseValue(ptr)];
+			ortsys![unsafe ReleaseValue(self.ptr_mut())];
+			crate::logging::drop!(Value, self.ptr());
 		}
 	}
 }
@@ -88,7 +116,7 @@ pub struct ValueRef<'v, Type: ValueTypeMarker + ?Sized = DynValueTypeMarker> {
 impl<'v, Type: ValueTypeMarker + ?Sized> ValueRef<'v, Type> {
 	pub(crate) fn new(inner: Value<Type>) -> Self {
 		ValueRef {
-			// We cannot upgade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
+			// We cannot upgrade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
 			// duration of the kernel, allowing an upgrade would allow a UAF.
 			upgradable: inner.inner.drop,
 			inner,
@@ -141,7 +169,7 @@ pub struct ValueRefMut<'v, Type: ValueTypeMarker + ?Sized = DynValueTypeMarker> 
 impl<'v, Type: ValueTypeMarker + ?Sized> ValueRefMut<'v, Type> {
 	pub(crate) fn new(inner: Value<Type>) -> Self {
 		ValueRefMut {
-			// We cannot upgade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
+			// We cannot upgrade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
 			// duration of the kernel, allowing an upgrade would allow a UAF.
 			upgradable: inner.inner.drop,
 			inner,
@@ -309,7 +337,7 @@ impl<Type: ValueTypeMarker + ?Sized> Value<Type> {
 		&self.inner.dtype
 	}
 
-	/// Construct a [`Value`] from a C++ [`ort_sys::OrtValue`] pointer.
+	/// Construct a [`Value`] from a C++ [`ort_sys::OrtValue`] pointer. Takes ownership of `ptr`.
 	///
 	/// If the value belongs to a session (i.e. if it is the result of an inference run), you must provide the
 	/// [`SharedSessionInner`] (acquired from [`Session::inner`](crate::session::Session::inner)). This ensures the
@@ -323,14 +351,15 @@ impl<Type: ValueTypeMarker + ?Sized> Value<Type> {
 	pub unsafe fn from_ptr(ptr: NonNull<ort_sys::OrtValue>, session: Option<Arc<SharedSessionInner>>) -> Value<Type> {
 		let mut typeinfo_ptr = ptr::null_mut();
 		ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr).expect("infallible"); nonNull(typeinfo_ptr)];
+
+		let dtype = unsafe { ValueType::from_type_info(typeinfo_ptr) };
+		let memory_info = unsafe { MemoryInfo::from_value(ptr) };
+
 		Value {
-			inner: Arc::new(ValueInner {
-				ptr,
-				memory_info: unsafe { MemoryInfo::from_value(ptr) },
-				dtype: unsafe { ValueType::from_type_info(typeinfo_ptr) },
-				drop: true,
-				_backing: session.map(|v| Box::new(v) as Box<dyn Any>)
-			}),
+			inner: match session {
+				Some(session) => ValueInner::new_backed(ptr, dtype, memory_info, true, Box::new(session)),
+				None => ValueInner::new(ptr, dtype, memory_info, true)
+			},
 			_markers: PhantomData
 		}
 	}
@@ -341,14 +370,15 @@ impl<Type: ValueTypeMarker + ?Sized> Value<Type> {
 	pub(crate) unsafe fn from_ptr_nodrop(ptr: NonNull<ort_sys::OrtValue>, session: Option<Arc<SharedSessionInner>>) -> Value<Type> {
 		let mut typeinfo_ptr = ptr::null_mut();
 		ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr).expect("infallible"); nonNull(typeinfo_ptr)];
+
+		let dtype = unsafe { ValueType::from_type_info(typeinfo_ptr) };
+		let memory_info = unsafe { MemoryInfo::from_value(ptr) };
+
 		Value {
-			inner: Arc::new(ValueInner {
-				ptr,
-				memory_info: unsafe { MemoryInfo::from_value(ptr) },
-				dtype: unsafe { ValueType::from_type_info(typeinfo_ptr) },
-				drop: false,
-				_backing: session.map(|v| Box::new(v) as Box<dyn Any>)
-			}),
+			inner: match session {
+				Some(session) => ValueInner::new_backed(ptr, dtype, memory_info, false, Box::new(session)),
+				None => ValueInner::new(ptr, dtype, memory_info, false)
+			},
 			_markers: PhantomData
 		}
 	}
@@ -452,7 +482,6 @@ impl<Type: ValueTypeMarker + ?Sized> AsPointer for Value<Type> {
 #[cfg(test)]
 mod tests {
 	use super::{DynTensorValueType, Map, Sequence, Tensor, TensorRef, TensorRefMut, TensorValueType};
-	use crate::memory::Allocator;
 
 	#[test]
 	fn test_casting_tensor() -> crate::Result<()> {
@@ -507,7 +536,7 @@ mod tests {
 		let map_contents = [("meaning".to_owned(), 42.0), ("pi".to_owned(), core::f32::consts::PI)];
 		let value = Sequence::new([Map::<String, f32>::new(map_contents)?])?;
 
-		for map in value.extract_sequence(&Allocator::default()) {
+		for map in value.extract_sequence() {
 			let map = map.extract_key_values().into_iter().collect::<std::collections::HashMap<_, _>>();
 			assert_eq!(map["meaning"], 42.0);
 			assert_eq!(map["pi"], core::f32::consts::PI);

@@ -1,6 +1,5 @@
 name: 🧩 Backends
 on:
-  workflow_dispatch:
   push:
     paths:
       - '.github/workflows/backends.yml'
@@ -9,16 +8,20 @@ on:
       - 'ort-sys/src/lib.rs'
       - 'Cargo.toml'
   pull_request:
+    types: [ opened, synchronize, reopened ]
     paths:
       - '.github/workflows/backends.yml'
       - 'src/**/*.rs'
       - 'backends/**/*.rs'
       - 'ort-sys/src/lib.rs'
       - 'Cargo.toml'
+permissions:
+  contents: read
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
 env:
   RUST_BACKTRACE: 1
-  CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_DEV_DEBUG: 0
 jobs:
   candle:
     name: Candle
@@ -30,7 +33,7 @@ jobs:
           - os: ubuntu-latest
           - os: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install protoc
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
@@ -42,7 +45,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2.9.1
       - name: Run tests
         run: |
           cargo test --manifest-path backends/candle/Cargo.toml -p ort-candle --verbose -- --test-threads 1
@@ -57,12 +60,26 @@ jobs:
           - os: windows-latest
           - os: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2.9.1
       - name: Run tests
         run: |
           cargo test --manifest-path backends/tract/Cargo.toml -p ort-tract --verbose -- --test-threads 1
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Run tests
+        run: |
+          cargo check --manifest-path backends/web/Cargo.toml -p ort-web --target wasm32-unknown-unknown

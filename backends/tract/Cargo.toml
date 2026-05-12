@@ -1,9 +1,9 @@
 [package]
 name = "ort-tract"
 description = "ort + tract = 🦀 - An alternative backend for ort, powered by tract."
-version = "0.1.0+0.21"
-edition = "2021"
-rust-version = "1.70"
+version = "0.3.0+0.22"
+edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pykeio/ort"
 homepage = "https://ort.pyke.io/backends/tract"
@@ -14,7 +14,7 @@ authors = [
 ]
 
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [ "standalone" ]
 default-members = []
 
@@ -31,18 +31,17 @@ path = "lib.rs"
 [features]
 
 [workspace.dependencies]
-ort-sys = { version = "=2.0.0-rc.10", path = "../../ort-sys", default-features = false }
+ort-sys = { version = "=2.0.0-rc.12", path = "../../ort-sys", default-features = false, features = [ "api-17" ] }
 
 [dependencies]
 ort-sys = { workspace = true }
-tract-onnx = "0.21"
+tract-onnx = "0.22"
 parking_lot = "0.12"
 
 [dev-dependencies]
-ort = { version = "=2.0.0-rc.10", path = "../../", default-features = false, features = [ "alternative-backend", "fetch-models", "ndarray" ] }
-ureq = "2.1"
+ort = { version = "=2.0.0-rc.12", path = "../../", default-features = false, features = [ "alternative-backend", "fetch-models", "tls-rustls", "ndarray", "api-17" ] }
 image = "0.25"
-ndarray = "0.16"
+ndarray = "0.17"
 
 [[test]]
 name = "memory"

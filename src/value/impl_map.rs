@@ -13,14 +13,13 @@ use std::collections::HashMap;
 
 use super::{
 	DowncastableTarget, DynValue, Value, ValueInner, ValueRef, ValueRefMut, ValueType, ValueTypeMarker,
-	impl_tensor::{DynTensor, Tensor}
+	impl_tensor::{DynTensor, IntoTensorElementType, PrimitiveTensorElementType, Tensor, TensorElementType}
 };
 use crate::{
 	AsPointer, ErrorCode,
 	error::{Error, Result},
 	memory::Allocator,
-	ortsys,
-	tensor::{IntoTensorElementType, PrimitiveTensorElementType, TensorElementType}
+	ortsys
 };
 
 pub trait MapValueTypeMarker: ValueTypeMarker {
@@ -88,15 +87,12 @@ impl<Type: MapValueTypeMarker + ?Sized> Value<Type> {
 	pub fn try_extract_key_values<K: IntoTensorElementType + Clone + Hash + Eq, V: PrimitiveTensorElementType + Clone>(&self) -> Result<Vec<(K, V)>> {
 		match self.dtype() {
 			ValueType::Map { key, value } => {
-				let k_type = K::into_tensor_element_type();
-				if k_type != *key {
-					return Err(Error::new_with_code(ErrorCode::InvalidArgument, format!("Cannot extract Map<{:?}, _> (value has K type {:?})", k_type, key)));
-				}
-				let v_type = V::into_tensor_element_type();
-				if v_type != *value {
+				let want_key = K::into_tensor_element_type();
+				let want_value = V::into_tensor_element_type();
+				if want_key != *key || want_value != *value {
 					return Err(Error::new_with_code(
 						ErrorCode::InvalidArgument,
-						format!("Cannot extract Map<{}, {}> from Map<{}, {}>", K::into_tensor_element_type(), V::into_tensor_element_type(), k_type, v_type)
+						format!("Cannot extract Map<{want_key}, {want_value}> from Map<{key}, {value}>")
 					));
 				}
 
@@ -130,13 +126,7 @@ impl<Type: MapValueTypeMarker + ?Sized> Value<Type> {
 							} else {
 								return Err(Error::new_with_code(
 									ErrorCode::InvalidArgument,
-									format!(
-										"Cannot extract Map<{}, {}> from Map<{}, {}>",
-										K::into_tensor_element_type(),
-										V::into_tensor_element_type(),
-										k_type,
-										v_type
-									)
+									format!("Cannot extract Map<{want_key}, {want_value}> from Map<{ty}, {value}>",)
 								));
 							}
 						}
@@ -267,16 +257,16 @@ impl<K: IntoTensorElementType + Debug + Clone + Hash + Eq + 'static, V: IntoTens
 			nonNull(value_ptr)
 		];
 		Ok(Value {
-			inner: Arc::new(ValueInner {
-				ptr: value_ptr,
-				dtype: ValueType::Map {
+			inner: ValueInner::new_backed(
+				value_ptr,
+				ValueType::Map {
 					key: K::into_tensor_element_type(),
 					value: V::into_tensor_element_type()
 				},
-				drop: true,
-				memory_info: None,
-				_backing: Some(Box::new(values))
-			}),
+				None,
+				true,
+				Box::new(values)
+			),
 			_markers: PhantomData
 		})
 	}
@@ -292,6 +282,10 @@ impl<K: IntoTensorElementType + Debug + Clone + Hash + Eq, V: PrimitiveTensorEle
 	pub fn extract_map(&self) -> HashMap<K, V> {
 		self.try_extract_map().expect("Failed to extract map")
 	}
+
+	pub fn iter(&self) -> impl ExactSizeIterator<Item = (K, V)> {
+		self.extract_key_values().into_iter()
+	}
 }
 
 impl<K: IntoTensorElementType + Debug + Clone + Hash + Eq, V: IntoTensorElementType + Debug + Clone> Value<MapValueType<K, V>> {
@@ -303,7 +297,7 @@ impl<K: IntoTensorElementType + Debug + Clone + Hash + Eq, V: IntoTensorElementT
 
 	/// Converts from a strongly-typed [`Map<K, V>`] to a reference to a type-erased [`DynMap`].
 	#[inline]
-	pub fn upcast_ref(&self) -> DynMapRef {
+	pub fn upcast_ref(&self) -> DynMapRef<'_> {
 		DynMapRef::new(Value {
 			inner: Arc::clone(&self.inner),
 			_markers: PhantomData
@@ -312,10 +306,56 @@ impl<K: IntoTensorElementType + Debug + Clone + Hash + Eq, V: IntoTensorElementT
 
 	/// Converts from a strongly-typed [`Map<K, V>`] to a mutable reference to a type-erased [`DynMap`].
 	#[inline]
-	pub fn upcast_mut(&mut self) -> DynMapRefMut {
+	pub fn upcast_mut(&mut self) -> DynMapRefMut<'_> {
 		DynMapRefMut::new(Value {
 			inner: Arc::clone(&self.inner),
 			_markers: PhantomData
 		})
+	}
+}
+
+impl<K: IntoTensorElementType + Debug + Clone + Hash + Eq, V: PrimitiveTensorElementType + Debug + Clone> IntoIterator for Value<MapValueType<K, V>> {
+	type Item = (K, V);
+	type IntoIter = alloc::vec::IntoIter<(K, V)>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.extract_key_values().into_iter()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use crate::value::Map;
+
+	#[test]
+	fn test_map_bad_extract() -> crate::Result<()> {
+		let keys = [String::from("1"), String::from("a"), String::from("3"), String::from("x"), String::from("abc")];
+		let values = [1.0f32, -3.0, 102.0, 0.009, 52.38124];
+
+		let map = Map::<String, f32>::new(keys.iter().cloned().zip(values.iter().cloned()))?;
+		assert!(map.try_extract_map::<u64, f32>().is_err());
+		assert!(map.try_extract_map::<String, u32>().is_err());
+		assert!(map.try_extract_map::<String, f32>().is_ok());
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_map_iter() -> crate::Result<()> {
+		let keys = [String::from("1"), String::from("a"), String::from("3"), String::from("x"), String::from("abc")];
+		let values = [1.0f32, -3.0, 102.0, 0.009, 52.38124];
+
+		let hash_map: HashMap<String, f32> = HashMap::from_iter(keys.iter().cloned().zip(values.iter().cloned()));
+		let map = Map::<String, f32>::new(keys.iter().cloned().zip(values.iter().cloned()))?;
+		for (key, value) in map.iter() {
+			assert_eq!(hash_map.get(&key), Some(&value));
+		}
+		for (key, value) in map {
+			assert_eq!(hash_map.get(&key), Some(&value));
+		}
+
+		Ok(())
 	}
 }

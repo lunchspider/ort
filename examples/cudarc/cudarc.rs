@@ -1,14 +1,13 @@
 use std::{ops::Mul, path::Path};
 
-use cudarc::driver::{CudaDevice, DevicePtr, DevicePtrMut, sys::CUdeviceptr};
+use cudarc::driver::{CudaDevice, DevicePtr};
 use image::{GenericImageView, ImageBuffer, Rgba, imageops::FilterType};
 use ndarray::Array;
 use ort::{
-	execution_providers::{CUDAExecutionProvider, ExecutionProvider},
+	ep,
 	memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
 	session::Session,
-	tensor::Shape,
-	value::TensorRefMut
+	value::{Shape, TensorRefMut}
 };
 use show_image::{AsImageView, WindowOptions, event};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -24,12 +23,12 @@ fn main() -> anyhow::Result<()> {
 	#[rustfmt::skip]
 	ort::init()
 		.with_execution_providers([
-			CUDAExecutionProvider::default()
+			ep::CUDA::default()
 				.build()
 				// exit the program with an error if the CUDA EP fails to register
 				.error_on_failure()
 		])
-		.commit()?;
+		.commit();
 
 	let mut session =
 		Session::builder()?.commit_from_url("https://cdn.pyke.io/0/pyke:ort-rs/example-models@0.0.0/modnet_photographic_portrait_matting.onnx")?;
@@ -48,12 +47,12 @@ fn main() -> anyhow::Result<()> {
 	}
 
 	let device = CudaDevice::new(0)?;
-	let device_data = device.htod_sync_copy(&input.into_raw_vec())?;
+	let device_data = device.htod_sync_copy(&input.into_raw_vec_and_offset().0)?;
 	let tensor: TensorRefMut<'_, f32> = unsafe {
 		TensorRefMut::from_raw(
 			MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?,
 			(*device_data.device_ptr() as usize as *mut ()).cast(),
-			Shape::from([1, 3, 512, 512])
+			Shape::from([1i64, 3, 512, 512])
 		)
 		.unwrap()
 	};
@@ -63,7 +62,7 @@ fn main() -> anyhow::Result<()> {
 
 	// convert to 8-bit
 	let output = output.mul(255.0).map(|x| *x as u8);
-	let output = output.into_raw_vec();
+	let (output, _) = output.into_raw_vec_and_offset();
 
 	// change rgb to rgba
 	let output_img = ImageBuffer::from_fn(512, 512, |x, y| {
@@ -83,10 +82,13 @@ fn main() -> anyhow::Result<()> {
 	let window = show_image::context()
 		.run_function_wait(move |context| -> Result<_, String> {
 			let mut window = context
-				.create_window("ort + modnet", WindowOptions {
-					size: Some([img_width, img_height]),
-					..WindowOptions::default()
-				})
+				.create_window(
+					"ort + modnet",
+					WindowOptions {
+						size: Some([img_width, img_height]),
+						..WindowOptions::default()
+					}
+				)
 				.map_err(|e| e.to_string())?;
 			window.set_image("photo", &output.as_image_view().map_err(|e| e.to_string())?);
 			Ok(window.proxy())

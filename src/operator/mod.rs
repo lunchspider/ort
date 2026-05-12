@@ -3,18 +3,18 @@
 use alloc::{boxed::Box, ffi::CString, vec::Vec};
 use core::ptr::{self, NonNull};
 
-pub mod attribute;
+mod attribute;
 pub(crate) mod bound;
-pub mod io;
-pub mod kernel;
+mod io;
+mod kernel;
 #[cfg(test)]
 mod tests;
 
-use self::{
-	attribute::FromOpAttr,
-	bound::BoundOperator,
-	io::{OperatorInput, OperatorOutput},
-	kernel::{Kernel, KernelAttributes}
+use self::bound::BoundOperator;
+pub use self::{
+	attribute::{Attribute, FromKernelAttributes, FromOpAttr, ToAttribute},
+	io::{InputOutputCharacteristic, OperatorInput, OperatorOutput},
+	kernel::{Kernel, KernelAttributes, KernelContext, ScratchBuffer}
 };
 use crate::{
 	AsPointer, Error,
@@ -36,7 +36,8 @@ pub trait Operator: Send {
 	/// Returns the name of the operator.
 	fn name(&self) -> &str;
 
-	/// Returns the execution provider this operator runs on, e.g. `CUDAExecutionProvider`.
+	/// Returns the internal name of the execution provider this operator runs on, e.g. `"CUDAExecutionProvider"` (see
+	/// [`ExecutionProvider::name`](crate::ep::ExecutionProvider::name)).
 	///
 	/// If the returned type is not `None`, and the execution provider used by the session matches this operator's
 	/// EP type, the value will not be copied to the CPU and you may use functions like [`Tensor::data_ptr`] to
@@ -44,7 +45,7 @@ pub trait Operator: Send {
 	/// stream.
 	///
 	/// [`Tensor::data_ptr`]: crate::value::Tensor::data_ptr
-	/// [`KernelContext::compute_stream`]: crate::operator::kernel::KernelContext::compute_stream
+	/// [`KernelContext::compute_stream`]: crate::operator::KernelContext::compute_stream
 	fn execution_provider_type(&self) -> Option<&str> {
 		None
 	}
@@ -93,7 +94,9 @@ impl ShapeInferenceContext {
 		})?;
 
 		let mut len = 0;
-		let _ = ortsys![unsafe ReadOpAttr(attr, T::attr_type(), ptr::null_mut(), 0, &mut len)];
+		// this will always error since the length we pass (0) is too small to hold anything; we don't care about value yet, we
+		// just want the real length which will end up in the `len` variable
+		let _ = ortsys![@ort: unsafe ReadOpAttr(attr, T::attr_type(), ptr::null_mut(), 0, &mut len) as Result];
 
 		unsafe { T::from_op_attr(attr, len) }
 	}
@@ -130,6 +133,7 @@ impl OperatorDomain {
 		let name = CString::new(name.as_ref())?;
 		let mut ptr: *mut ort_sys::OrtCustomOpDomain = ptr::null_mut();
 		ortsys![unsafe CreateCustomOpDomain(name.as_ptr(), &mut ptr)?; nonNull(ptr)];
+		crate::logging::create!(OperatorDomain, ptr);
 		Ok(Self {
 			ptr,
 			_name: name,
@@ -161,5 +165,6 @@ impl AsPointer for OperatorDomain {
 impl Drop for OperatorDomain {
 	fn drop(&mut self) {
 		ortsys![unsafe ReleaseCustomOpDomain(self.ptr.as_ptr())];
+		crate::logging::drop!(OperatorDomain, self.ptr);
 	}
 }

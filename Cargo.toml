@@ -1,9 +1,11 @@
 [workspace]
+resolver = "3"
 members = [ 'ort-sys' ]
 default-members = [ '.' ]
 exclude = [
 	'backends/candle',
 	'backends/tract',
+	'backends/web',
 	'examples/async-gpt2-api',
 	'examples/cudarc',
 	'examples/custom-ops',
@@ -20,10 +22,10 @@ exclude = [
 
 [package]
 name = "ort"
-description = "A safe Rust wrapper for ONNX Runtime 1.22 - Optimize and accelerate machine learning inference & training"
-version = "2.0.0-rc.10"
-edition = "2021"
-rust-version = "1.85"
+description = "A safe Rust wrapper for ONNX Runtime 1.26 - Optimize and accelerate machine learning inference & training"
+version = "2.0.0-rc.12"
+edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pykeio/ort"
 homepage = "https://ort.pyke.io/"
@@ -34,23 +36,20 @@ authors = [
 	"pyke.io <contact@pyke.io>",
 	"Nicolas Bigaouette <nbigaouette@gmail.com>"
 ]
-include = [ "/src/", "/LICENSE-APACHE", "/LICENSE-MIT", "/README.md" ]
+include = [ "/src/", "/LICENSE-APACHE", "/LICENSE-MIT" ]
 
-[profile.release]
-opt-level = 3
-lto = true
-strip = true
-codegen-units = 1
+[badges.maintenance]
+status = "actively-developed"
 
 [package.metadata.docs.rs]
 features = [ "std", "ndarray", "half", "num-complex", "training", "fetch-models", "load-dynamic", "copy-dylibs" ]
-targets = ["x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 rustdoc-args = [ "--cfg", "docsrs" ]
 
 [features]
-default = [ "std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs" ]
+default = [ "std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-26" ]
 
-std = [ "ort-sys/std", "ndarray/std", "tracing?/std" ]
+std = [ "ort-sys/std", "ndarray?/std", "tracing?/std" ]
 training = [ "ort-sys/training" ]
 
 ndarray = [ "dep:ndarray" ]
@@ -60,13 +59,26 @@ tracing = [ "dep:tracing" ]
 
 fetch-models = [ "std", "dep:ureq", "dep:sha2" ]
 download-binaries = [ "ort-sys/download-binaries" ]
-load-dynamic = [ "std", "libloading", "ort-sys/load-dynamic" ]
+preload-dylibs = [ "dep:libloading" ]
+load-dynamic = [ "std", "preload-dylibs", "ort-sys/disable-linking" ]
 copy-dylibs = [ "ort-sys/copy-dylibs" ]
+pkg-config = [ "ort-sys/pkg-config" ]
 
-tls-rustls = [ "ort-sys/tls-rustls" ]
-tls-rustls-no-provider = [ "ort-sys/tls-rustls-no-provider" ]
-tls-native = [ "ort-sys/tls-native" ]
-tls-native-vendored = [ "ort-sys/tls-native-vendored" ]
+api-17 = [ "ort-sys/api-17" ]
+api-18 = [ "ort-sys/api-18", "api-17" ]
+api-19 = [ "ort-sys/api-19", "api-18" ]
+api-20 = [ "ort-sys/api-20", "api-19" ]
+api-21 = [ "ort-sys/api-21", "api-20" ]
+api-22 = [ "ort-sys/api-22", "api-21" ]
+api-23 = [ "ort-sys/api-23", "api-22" ]
+api-24 = [ "ort-sys/api-24", "api-23" ]
+api-25 = [ "ort-sys/api-25", "api-24" ]
+api-26 = [ "ort-sys/api-26", "api-25" ]
+
+tls-rustls = [ "ort-sys/tls-rustls", "ureq?/rustls" ]
+tls-rustls-no-provider = [ "ort-sys/tls-rustls-no-provider", "ureq?/rustls-no-provider" ]
+tls-native = [ "ort-sys/tls-native", "ureq?/native-tls" ]
+tls-native-vendored = [ "ort-sys/tls-native-vendored", "ureq?/native-tls", "ureq?/vendored" ]
 
 alternative-backend = [ "ort-sys/disable-linking" ]
 
@@ -89,23 +101,25 @@ cann = [ "ort-sys/cann" ]
 qnn = [ "ort-sys/qnn" ]
 webgpu = [ "ort-sys/webgpu" ]
 azure = [ "ort-sys/azure" ]
-nv = [ "ort-sys/nv" ]
+nvrtx = [ "ort-sys/nvrtx" ]
 
 [dependencies]
-ort-sys = { version = "=2.0.0-rc.10", path = "ort-sys", default-features = false }
-smallvec = { version = "=2.0.0-alpha.10", default-features = false }
+ort-sys = { version = "=2.0.0-rc.12", path = "ort-sys", default-features = false }
+smallvec = { version = "1.15", default-features = false, features = [ "const_generics" ] }
 
-ndarray = { version = "0.16", default-features = false, optional = true }
-libloading = { version = "0.8", optional = true }
-ureq = { version = "3", optional = true, default-features = false, features = [ "rustls" ] }
-sha2 = { version = "0.10", optional = true }
+ndarray = { version = "0.17", default-features = false, optional = true }
 tracing = { version = "0.1", optional = true, default-features = false }
 half = { version = "2.1", default-features = false, optional = true }
 num-complex = { version = "0.4", default-features = false, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3.1", optional = true, default-features = false }
+sha2 = { version = "0.10", optional = true }
+libloading = { version = "0.9", optional = true }
+
 [dev-dependencies]
 anyhow = "1.0"
 ureq = { version = "3", default-features = false, features = [ "native-tls" ] }
-image = "0.25"
+image = { version = "0.25", default-features = false, features = [ "png", "jpeg" ] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [ "env-filter", "fmt" ] }
 tokio = { version = "1.36", features = [ "test-util" ] }

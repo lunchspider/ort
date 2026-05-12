@@ -1,3 +1,43 @@
+//! Provides [`ModelCompiler`], which optimizes and creates EP graphs for an ONNX model ahead-of-time to greatly reduce
+//! startup time.
+//!
+//! Many [execution providers](crate::ep) use a third-party graph-based neural network API (like
+//! CoreML, DirectML, CUDA graphs, TensorRT, etc.). The EPs must convert the ONNX graph to these device-native graphs,
+//! which can take a lot of work - especially when you consider that both ONNX Runtime and the EP backend are doing
+//! their own optimizations on their respective graphs! The end result is that [sessions](crate::session) can often take
+//! a very long time to initialize - often multiple seconds and, in the case of more complex models, upwards of minutes.
+//! This is unacceptable for many applications, hence the need for [`ModelCompiler`].
+//!
+//! [`ModelCompiler`] is created like a normal [`Session`](crate::session::Session), except instead of ever performing
+//! inference on the model, [`ModelCompiler`] only:
+//! - optimizes the ONNX model;
+//! - creates the EP graph(s);
+//! - saves EP states in a new model.
+//!
+//! Loading a compiled model like one would with any other `.onnx` model (using the same EPs & options used to compile
+//! it) will greatly reduce the time required for the EP graph step. The model must be compiled on the end user's
+//! system; you can't distribute pre-compiled models.
+//!
+//! ```no_run
+//! # use std::path::PathBuf;
+//! # use ort::{compiler::ModelCompiler, session::Session, ep};
+//! # fn main() -> ort::Result<()> {
+//! let mut session_options = Session::builder()?.with_execution_providers([ep::CoreML::default()
+//! 	.with_model_format(ep::coreml::ModelFormat::MLProgram)
+//! 	.build()])?;
+//!
+//! let compiled_path = PathBuf::from("model-coreml.compiled.onnx");
+//! if !compiled_path.exists() {
+//! 	ModelCompiler::new(session_options.clone())?
+//! 		.with_model_from_file("model.onnx")?
+//! 		.compile_to_file(&compiled_path)?;
+//! }
+//!
+//! let session = session_options.commit_from_file(&compiled_path)?;
+//! # Ok(())
+//! # }
+//! ```
+
 use core::{
 	ffi::c_void,
 	marker::PhantomData,
@@ -10,7 +50,6 @@ use std::path::Path;
 
 use crate::{
 	AsPointer,
-	environment::get_environment,
 	error::{Error, Result},
 	memory::Allocator,
 	ortsys,
@@ -19,7 +58,7 @@ use crate::{
 };
 
 /// Returns a pointer to the global [`ort_sys::OrtCompileApi`] object, or errors if the Compile API is not
-/// supported.
+/// supported by this backend.
 pub fn compile_api() -> Result<&'static ort_sys::OrtCompileApi> {
 	struct CompileApiPointer(*const ort_sys::OrtCompileApi);
 	unsafe impl Send for CompileApiPointer {}
@@ -42,25 +81,25 @@ pub fn compile_api() -> Result<&'static ort_sys::OrtCompileApi> {
 
 pub struct ModelCompiler<'i> {
 	ptr: NonNull<ort_sys::OrtModelCompilationOptions>,
-	_session_options: SessionBuilder,
+	session_options: SessionBuilder,
 	_p: PhantomData<&'i ()>
 }
 
 impl<'i> ModelCompiler<'i> {
 	pub fn new(options: SessionBuilder) -> Result<Self> {
-		let env = get_environment()?;
 		let mut ptr = ptr::null_mut();
 		ortsys![@compile:
 			unsafe CreateModelCompilationOptionsFromSessionOptions(
-				env.ptr(),
+				options.environment.ptr(),
 				options.ptr(),
 				&mut ptr
 			)?;
 			nonNull(ptr)
 		];
+		crate::logging::create!(ModelCompiler, ptr);
 		Ok(Self {
 			ptr,
-			_session_options: options,
+			session_options: options,
 			_p: PhantomData
 		})
 	}
@@ -89,16 +128,26 @@ impl<'i> ModelCompiler<'i> {
 		Ok(unsafe { mem::transmute::<ModelCompiler<'i>, ModelCompiler<'i2>>(self) })
 	}
 
-	pub fn with_embed_ep_context(self, enable: bool) -> Result<Self> {
+	/// Embed the execution provider context in the model.
+	///
+	/// This context typically includes binary data to be used by the execution provider, like weights. The default
+	/// behavior (when this option is not enabled) is for the execution provider to place context data in a
+	/// temporary path, and store that path in the compiled model. Enabling this option will instead embed that data
+	/// directly in the compiled model, meaning it won't rely on other files on the system.
+	pub fn with_embed_ep_context(self) -> Result<Self> {
 		ortsys![@compile:
 			unsafe ModelCompilationOptions_SetEpContextEmbedMode(
 				self.ptr.as_ptr(),
-				enable
+				true
 			)?
 		];
 		Ok(self)
 	}
 
+	/// Store uncompiled initializers over a given `threshold` in a separate file at `path`.
+	///
+	/// Initializers present in the original model that 1) are not used in the compiled graph, and 2) are larger than
+	/// `threshold` bytes, will be stored in the file.
 	#[cfg(feature = "std")]
 	#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 	pub fn with_external_initializers<P: AsRef<Path>>(self, threshold: usize, path: P) -> Result<Self> {
@@ -116,7 +165,6 @@ impl<'i> ModelCompiler<'i> {
 	#[cfg(feature = "std")]
 	#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 	pub fn compile_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-		let env = get_environment()?;
 		let model_path = crate::util::path_to_os_char(path);
 		ortsys![@compile:
 			unsafe ModelCompilationOptions_SetOutputModelPath(
@@ -124,12 +172,11 @@ impl<'i> ModelCompiler<'i> {
 				model_path.as_ptr()
 			)?
 		];
-		ortsys![@compile: unsafe CompileModel(env.ptr(), self.ptr.as_ptr())?];
+		ortsys![@compile: unsafe CompileModel(self.session_options.environment.ptr(), self.ptr.as_ptr())?];
 		Ok(())
 	}
 
 	pub fn compile_to_buffer(&self) -> Result<CompiledModel> {
-		let env = get_environment()?;
 		let mut allocator = Allocator::default();
 		let mut ptr = ptr::null_mut();
 		let mut size = 0;
@@ -141,7 +188,8 @@ impl<'i> ModelCompiler<'i> {
 				&mut size
 			)?
 		];
-		ortsys![@compile: unsafe CompileModel(env.ptr(), self.ptr.as_ptr())?];
+		ortsys![@compile: unsafe CompileModel(self.session_options.environment.ptr(), self.ptr.as_ptr())?];
+		crate::logging::create!(CompiledModel, ptr);
 		Ok(CompiledModel { ptr, size, allocator })
 	}
 }
@@ -156,6 +204,7 @@ impl AsPointer for ModelCompiler<'_> {
 impl Drop for ModelCompiler<'_> {
 	fn drop(&mut self) {
 		ortsys![@compile: unsafe ReleaseModelCompilationOptions(self.ptr.as_ptr())];
+		crate::logging::drop!(ModelCompiler, self.ptr);
 	}
 }
 
@@ -181,5 +230,23 @@ impl Deref for CompiledModel {
 impl Drop for CompiledModel {
 	fn drop(&mut self) {
 		unsafe { self.allocator.free(self.ptr) };
+		crate::logging::drop!(CompiledModel, self.ptr);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::{compiler::ModelCompiler, session::builder::SessionBuilder};
+
+	#[test]
+	fn test_compile_in_memory() -> crate::Result<()> {
+		let compiled_model = ModelCompiler::new(SessionBuilder::new()?)?
+			.with_embed_ep_context()?
+			.with_model_from_file("tests/data/upsample.onnx")?
+			.compile_to_buffer()?;
+
+		let _model = SessionBuilder::new()?.commit_from_memory(&compiled_model)?;
+
+		Ok(())
 	}
 }
